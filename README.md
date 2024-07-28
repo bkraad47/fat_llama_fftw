@@ -1,42 +1,23 @@
 ![Fat Llama Logo](https://drive.google.com/uc?export=view&id=1BHe352g43zAdDYLDusBrBPdNvRIvlQwp)
 
-# Fat Llama ![build - status](https://github.com/bkraad47/fat_llama/actions/workflows/tests.yml/badge.svg) ![PyPI](https://img.shields.io/pypi/v/fat-llama?label=pypi%20package) ![PyPI - Downloads](https://img.shields.io/pypi/dm/fat-llama)
-fat_llama is a Python package for upscaling audio files to FLAC or WAV formats using advanced audio processing techniques. It utilizes CUDA-accelerated calculations to enhance audio quality by upsampling and adding missing frequencies through FFT (Fast Fourier Transform), resulting in richer and more detailed audio.
+# Fat Llama ![build - status](https://github.com/bkraad47/fat_llama_fftw/actions/workflows/tests.yml/badge.svg) ![PyPI](https://img.shields.io/pypi/v/fat-llama-fftw?label=pypi%20package) ![PyPI - Downloads](https://img.shields.io/pypi/dm/fat-llama-fftw)
+fat_llama is a Python package for upscaling audio files to FLAC or WAV formats using advanced audio processing techniques. It utilizes cpu-accelerated calculations to enhance audio quality by upsampling and adding missing frequencies through FFT (Fast Fourier Transform), resulting in richer and more detailed audio.
 
 ## Features
 
 - Upscale MP3 files to high-quality FLAC format.
 - Optional iterative soft thresholding (IST) for enhanced audio processing.
 - Gain adjustment, equalization, and optional Wiener filtering.
-- Supports GPU-accelerated processing with CuPy.
-
-## Requirements
-
-- CUDA capable GPU
 
 ## Installation
 
 Install via pip:
 ```
-pip install fat-llama
+pip install fat-llama-fftw
 ```
-Note: This version works with CUDA 12.
-
-Further need CUDA & CuPy properly installed: https://docs.cupy.dev/en/stable/install.html
+Note: For cpu verison please look at https://pypi.org/project/fat-llama/
 
 Also, requires ffmpeg: https://support.audacityteam.org/basics/installing-ffmpeg
-
-**Note to install on older versions of CUDA and CuPy. You will need to download specific versions and install locally.**
-
-- cupy version - https://github.com/bkraad47/fat_llama/tree/v-0.1.3---cupy
-- cupy-cuda11x version - https://github.com/bkraad47/fat_llama/tree/v-0.1.3---cupy-cuda11x
-
-To install locally:
-```
-git clone <target_url>
-cd fat_llama
-pip install .
-```
 
 ## Usage
 
@@ -109,6 +90,12 @@ ericzo - beyond link(https://soundcloud.com/ericzomusic/free-electro-trap-anthem
 ## Changelog
 
 All notable changes to this project will be documented in this file.
+
+### [1.0.3] - [1.0.4] - 2024-07-26
+
+#### Changed
+
+- Moved to `pyfftw` from CUDA.
 
 ### [1.0.2] - 2024-07-26
 

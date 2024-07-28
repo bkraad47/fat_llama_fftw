@@ -1,4 +1,4 @@
-from fat_llama.audio_fattener.feed import upscale
+from fat_llama_fftw.audio_fattener.feed import upscale
 
 # Example call to the method
 upscale(

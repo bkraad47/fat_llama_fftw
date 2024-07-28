@@ -23,7 +23,7 @@ jobs:
       run: |
         python -m pip install --upgrade pip
         pip install numpy
-        pip install cupy-cuda12x
+        pip install pyfftw
         pip install pydub
         pip install soundfile
         pip install mutagen
@@ -33,4 +33,4 @@ jobs:
         pip install .
     - name: Run tests
       run: |
-        python -m unittest discover -s fat_llama/tests
+        python -m unittest discover -s fat_llama_fftw/tests
