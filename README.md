@@ -26,7 +26,7 @@ Also, requires ffmpeg: https://support.audacityteam.org/basics/installing-ffmpeg
 You can run the example provided in example.py:
 
 ```
-from fat_llama.audio_fattener.feed import upscale
+from fat_llama_fftw.audio_fattener.feed import upscale
 
 # Example call to the method
 upscale(
