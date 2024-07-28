@@ -15,7 +15,7 @@ Install via pip:
 ```
 pip install fat-llama-fftw
 ```
-Note: For cpu verison please look at https://pypi.org/project/fat-llama/
+Note: For CUDA verison please look at https://pypi.org/project/fat-llama/
 
 Also, requires ffmpeg: https://support.audacityteam.org/basics/installing-ffmpeg
 
