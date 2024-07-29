@@ -14,7 +14,7 @@ fat_llama is a Python package for upscaling audio files to FLAC or WAV formats u
 
 Install via pip:
 ```
-pip install fat-llama-fftw
+pip install fat-llama-fftw 
 ```
 **(Note: For CUDA verison please look at https://pypi.org/project/fat-llama/)**
 
