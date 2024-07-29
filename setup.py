@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name='fat_llama_fftw',
-    version='1.0.4.4',
+    version='1.0.4.5',
     packages=find_packages(),
     install_requires=[
         'numpy',
