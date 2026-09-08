@@ -1,10 +1,10 @@
-import numpy as np
-import pyfftw
-import concurrent.futures
-from pydub import AudioSegment
-import soundfile as sf
 import os
 import logging
+
+import numpy as np
+import pyfftw
+from pydub import AudioSegment
+import soundfile as sf
 from mutagen.mp3 import MP3
 from mutagen.flac import FLAC
 from mutagen.oggvorbis import OggVorbis
@@ -14,15 +14,16 @@ from mutagen.wave import WAVE
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+
 def read_audio(file_path, format):
     if not os.path.exists(file_path):
         raise FileNotFoundError(f"File {file_path} not found.")
-    
+
     audio = AudioSegment.from_file(file_path, format=format)
     samples = np.array(audio.get_array_of_samples())
     sample_rate = audio.frame_rate
     bitrate = None
-    
+
     if format == 'mp3':
         mp3_info = MP3(file_path)
         bitrate = mp3_info.info.bitrate
@@ -38,37 +39,43 @@ def read_audio(file_path, format):
     else:
         duration_seconds = len(audio) / 1000.0
         bitrate = (len(samples) * 8) / duration_seconds
-    
+
     if audio.channels == 2:
         samples = samples.reshape((-1, 2))
-    
+
     return sample_rate, samples, bitrate, audio
+
 
 def write_audio(file_path, sample_rate, data, format):
     if format == 'flac':
-        sf.write(file_path, data.astype(np.float32), sample_rate, format='FLAC', subtype='PCM_24')
+        sf.write(file_path, data.astype(np.float32), sample_rate,
+                 format='FLAC', subtype='PCM_24')
     elif format == 'wav':
-        sf.write(file_path, data.astype(np.float32), sample_rate, format='WAV', subtype='PCM_24')
+        sf.write(file_path, data.astype(np.float32), sample_rate,
+                 format='WAV', subtype='PCM_24')
     else:
         raise ValueError(f"Unsupported target format: {format}")
+
 
 def new_interpolation_algorithm(data, upscale_factor):
     original_length = len(data)
     expanded_length = original_length * upscale_factor
     expanded_data = np.zeros(expanded_length, dtype=np.float32)
-    
+
     for i in range(original_length):
         center_point = data[i]
         for j in range(upscale_factor):
             index = i * upscale_factor + j
             expanded_data[index] = center_point
-    
+
     return expanded_data
+
 
 def initialize_ist(data, threshold):
     mask = np.abs(data) > threshold
     data_thres = np.where(mask, data, 0)
     return data_thres
+
 
 def perform_ist_iteration(data_thres, threshold):
     data_fft = pyfftw.interfaces.numpy_fft.fft(data_thres)
@@ -77,32 +84,79 @@ def perform_ist_iteration(data_thres, threshold):
     data_thres = pyfftw.interfaces.numpy_fft.ifft(data_fft_thres).real
     return data_thres
 
-def iterative_soft_thresholding(data, max_iter, threshold):
+
+def iterative_soft_thresholding(data, max_iter, threshold,
+                                convergence_tol=1e-6):
+    # Each IST pass must refine the *previous* pass's own estimate - that
+    # sequential dependency is the algorithm (see README's "Why FFT and
+    # IST?" and project-mission.md). A ThreadPoolExecutor that submits all
+    # max_iter iterations concurrently against the same starting
+    # data_thres cannot express that chain: every worker independently
+    # re-derives from the same input, so the result is whichever future
+    # happens to finish last - equivalent to a single iteration, no matter
+    # how large max_iter is. Chain them explicitly instead.
+    #
+    # Hard-threshold IST is also a fixed-point projection: fft/ifft are
+    # exact inverses, so once a pass's thresholded frequency support is
+    # produced, the next pass's fft reproduces that same support (up to
+    # floating-point rounding) and thresholding it again is a no-op.
+    # Running the full max_iter passes regardless would burn compute on
+    # iterations that provably do not change the result, so stop as soon
+    # as a pass changes the estimate by less than convergence_tol relative
+    # to its own scale - this returns the same fixed point max_iter would
+    # have reached, just without the wasted passes.
     data_thres = initialize_ist(data, threshold)
-    
-    with concurrent.futures.ThreadPoolExecutor() as executor:
-        futures = {executor.submit(perform_ist_iteration, data_thres, threshold) for _ in range(max_iter)}
-        for i, future in enumerate(concurrent.futures.as_completed(futures)):
-            data_thres = future.result()
-    
+    scale = max(np.max(np.abs(data_thres)), 1e-12)
+
+    for _ in range(max_iter):
+        next_data_thres = perform_ist_iteration(data_thres, threshold)
+        diff = np.max(np.abs(next_data_thres - data_thres))
+        converged = diff < convergence_tol * scale
+        data_thres = next_data_thres
+        if converged:
+            break
+
     return data_thres
+
 
 def upscale_channels(channels, upscale_factor, max_iter, threshold):
     processed_channels = []
     for channel in channels.T:
         logger.info("Interpolating data...")
-        expanded_channel = new_interpolation_algorithm(channel, upscale_factor)
+        expanded_channel = new_interpolation_algorithm(channel,
+                                                        upscale_factor)
 
         logger.info("Performing IST...")
-        ist_changes = iterative_soft_thresholding(expanded_channel, max_iter, threshold)
+        ist_changes = iterative_soft_thresholding(expanded_channel,
+                                                   max_iter, threshold)
         expanded_channel = expanded_channel.astype(np.float32) + ist_changes
 
         processed_channels.append(expanded_channel)
-    
+
     return np.column_stack(processed_channels)
+
 
 def normalize_signal(signal):
     return signal / np.max(np.abs(signal))
+
+
+def apply_nyquist_cutoff(signal, sample_rate, original_nyquist):
+    """Zero out all FFT bins above the original source's Nyquist frequency.
+
+    fat_llama upscales precision/headroom within the original recording's
+    real bandwidth - it must never leave (or reintroduce) audible content
+    above original_sample_rate / 2 in the output, whether that comes from
+    the zero-order-hold interpolation's spectral imaging, IST, or anything
+    else. This is applied as the final processing stage, after all other
+    steps, per project-mission.md's hard constraint.
+    """
+    n = len(signal)
+    spectrum = pyfftw.interfaces.numpy_fft.rfft(signal)
+    freqs = np.fft.rfftfreq(n, d=1.0 / sample_rate)
+    spectrum = np.where(freqs > original_nyquist, 0, spectrum)
+    filtered = pyfftw.interfaces.numpy_fft.irfft(spectrum, n=n)
+    return filtered.astype(np.float32)
+
 
 def upscale(
         input_file_path,
@@ -117,24 +171,31 @@ def upscale(
         'flac': (800, 1411),
         'wav': (800, 6444),
     }
-    
+
     if target_format not in valid_bitrate_ranges:
         raise ValueError(f"Unsupported target format: {target_format}")
-    
+
     min_bitrate, max_bitrate = valid_bitrate_ranges[target_format]
-    
+
     if not (min_bitrate <= target_bitrate_kbps <= max_bitrate):
-        raise ValueError(f"{target_format.upper()} bitrate out of range. Please provide a value between {min_bitrate} and {max_bitrate} kbps.")
-    
+        raise ValueError(
+            f"{target_format.upper()} bitrate out of range. Please "
+            f"provide a value between {min_bitrate} and {max_bitrate} kbps."
+        )
+
     logger.info(f"Loading {source_format.upper()} file...")
-    sample_rate, samples, bitrate, audio = read_audio(input_file_path, format=source_format)
+    sample_rate, samples, bitrate, audio = read_audio(input_file_path,
+                                                       format=source_format)
     if bitrate:
-        logger.info(f"Original {source_format.upper()} bitrate: {bitrate / 1000:.2f} kbps")
-    
+        logger.info(
+            f"Original {source_format.upper()} bitrate: "
+            f"{bitrate / 1000:.2f} kbps"
+        )
+
     samples = np.array(audio.get_array_of_samples())
     if audio.channels == 2:
         samples = samples.reshape((-1, 2))
-    
+
     target_bitrate = target_bitrate_kbps * 1000
     upscale_factor = round(target_bitrate / bitrate) if bitrate else 4
     logger.info(f"Upscale factor set to: {upscale_factor}")
@@ -153,11 +214,12 @@ def upscale(
         max_iter=max_iterations,
         threshold=threshold_value
     )
-    
+
     logger.info("Auto-scaling amplitudes based on original audio...")
     scaled_upscaled_channels = []
     for i, channel in enumerate(channels.T):
-        scaled_channel = normalize_signal(upscaled_channels[:, i]) * np.max(np.abs(channel))
+        scaled_channel = (normalize_signal(upscaled_channels[:, i])
+                          * np.max(np.abs(channel)))
         scaled_upscaled_channels.append(scaled_channel)
     scaled_upscaled_channels = np.column_stack(scaled_upscaled_channels)
 
@@ -166,8 +228,23 @@ def upscale(
     for i in range(scaled_upscaled_channels.shape[1]):
         normalized_channel = normalize_signal(scaled_upscaled_channels[:, i])
         normalized_upscaled_channels.append(normalized_channel)
-    normalized_upscaled_channels = np.column_stack(normalized_upscaled_channels)
+    normalized_upscaled_channels = np.column_stack(
+        normalized_upscaled_channels)
 
     new_sample_rate = sample_rate * upscale_factor
-    write_audio(output_file_path, new_sample_rate, normalized_upscaled_channels, target_format)
-    logger.info(f"Saved processed {target_format.upper()} file at {output_file_path}")
+
+    logger.info("Removing content above the original Nyquist frequency...")
+    original_nyquist = sample_rate / 2.0
+    final_channels = []
+    for i in range(normalized_upscaled_channels.shape[1]):
+        filtered_channel = apply_nyquist_cutoff(
+            normalized_upscaled_channels[:, i], new_sample_rate,
+            original_nyquist
+        )
+        final_channels.append(filtered_channel)
+    final_channels = np.column_stack(final_channels)
+
+    write_audio(output_file_path, new_sample_rate, final_channels,
+               target_format)
+    logger.info(f"Saved processed {target_format.upper()} file at "
+               f"{output_file_path}")
