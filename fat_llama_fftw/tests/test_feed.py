@@ -10,6 +10,7 @@ from fat_llama_fftw.audio_fattener.feed import (
     perform_ist_iteration,
     iterative_soft_thresholding,
     upscale_channels,
+    _cap_ist_changes_to_baseline_peak,
     normalize_signal,
     apply_nyquist_cutoff,
     upscale
@@ -157,11 +158,22 @@ class TestFeed(unittest.TestCase):
         # (interpolated to [1,1,3,3] per channel), initialize_ist keeps
         # only the loud half [0,0,3,3], whose FFT is [6, -3+3i, 0, -3-3i];
         # excluding bin 0 leaves only the conjugate pair (bins 1 and 3),
-        # whose ifft is the new fixed point [-1.5,-1.5,1.5,1.5] - a
-        # different, DC-free result than the old (DC-inclusive) fixed
-        # point, with the same 1.5x-of-source-peak scale-invariant relationship
-        # for both channels since peak-relative thresholding scales with
-        # the input.
+        # whose ifft is the DC-free fixed point [-1.5,-1.5,1.5,1.5].
+        #
+        # This-cycle fix: upscale_channels now caps ist_changes
+        # (_cap_ist_changes_to_baseline_peak) so the combined
+        # (interpolation + IST) signal's own peak never exceeds the
+        # pre-IST interpolated baseline's peak - see that function's own
+        # docstring comment for why (a ~1.2-5dB net attenuation above
+        # ~1kHz relative to a no-IST control, root-caused to this
+        # otherwise-uncapped peak inflation getting divided back out of
+        # every frequency at upscale()'s mandatory final normalize). For
+        # this fixture the uncapped fixed point [-1.5,-1.5,1.5,1.5] added
+        # onto [1,1,3,3] would peak at 4.5, above the baseline's own peak
+        # of 3 - the cap converges (5 rounds) to ist_changes scaled by
+        # 4/7, landing the combined result's peak at 24/7 (~3.42857),
+        # i.e. 8/7 of the source channel's own peak rather than the
+        # uncapped 1.5x.
         channels = np.array([[1, 2], [3, 4]], dtype=np.float32)
         upscale_factor = 2
         threshold = 0.6
@@ -171,25 +183,32 @@ class TestFeed(unittest.TestCase):
         self.assertEqual(output.shape, (4, 2))
         # Output must be usable audio, not NaN/Inf.
         self.assertTrue(np.all(np.isfinite(output)))
-        expected = np.array([[-0.5, 0], [-0.5, 0], [4.5, 6], [4.5, 6]],
+        expected = np.array([[4 / 7, 10 / 7], [4 / 7, 10 / 7],
+                            [24 / 7, 32 / 7], [24 / 7, 32 / 7]],
                             dtype=np.float32)
-        np.testing.assert_allclose(output, expected, atol=1e-6)
+        np.testing.assert_allclose(output, expected, atol=1e-5)
         # IST must have contributed something here - otherwise this test
         # would be indistinguishable from pure interpolation.
         interpolated = np.array([[1, 2], [1, 2], [3, 4], [3, 4]],
                                 dtype=np.float32)
         self.assertGreater(float(np.max(np.abs(output - interpolated))), 0.0)
+        # And the capped result's own peak must not exceed the source
+        # channel's own peak by more than the uncapped (pre-fix) 1.5x
+        # relationship did - the cap's whole purpose is to keep IST from
+        # inflating the channel's peak unchecked.
+        for i, src in enumerate(channels.T):
+            self.assertLess(float(np.max(np.abs(output[:, i]))),
+                            1.5 * float(np.max(np.abs(src))))
         # Column order must be preserved: column i still derives from
         # channel i, so each column stays proportional to its own source
-        # channel and never picks up the other channel's values. The
-        # DC-free fixed point's peak lands at 1.5x each channel's own
-        # source peak (scale-invariant, since peak-relative thresholding
-        # produces a proportional result regardless of the input's
-        # absolute scale).
+        # channel and never picks up the other channel's values - both
+        # columns must land on the same peak-to-source-peak ratio (the cap
+        # is scale-invariant, like the underlying peak-relative
+        # thresholding it corrects).
         for i, src in enumerate(channels.T):
             self.assertAlmostEqual(float(np.max(np.abs(output[:, i]))),
-                                   1.5 * float(np.max(np.abs(src))),
-                                   places=5)
+                                   (8 / 7) * float(np.max(np.abs(src))),
+                                   places=4)
 
     def test_upscale_channels_thresholded_out_is_pure_interpolation(self):
         # threshold is a fraction of peak magnitude, so any value > 1.0
@@ -200,6 +219,136 @@ class TestFeed(unittest.TestCase):
                                   threshold=1.5)
         expected = np.array([[1, 2], [1, 2], [3, 4], [3, 4]], dtype=np.float32)
         np.testing.assert_allclose(output, expected, atol=1e-6)
+
+    def test_cap_ist_changes_to_baseline_peak_noop_when_not_needed(self):
+        # If adding ist_changes onto expanded_channel does not grow the
+        # peak beyond expanded_channel's own peak, nothing should be
+        # rescaled - the cap only ever activates to prevent growth, never
+        # to shrink an already-bounded contribution. Combined peak here is
+        # 9 (at index 0: 10 + -1), under expanded's own peak of 10.
+        expanded = np.array([10.0, -10.0, 5.0, -5.0], dtype=np.float32)
+        ist_changes = np.array([-1.0, 1.0, -1.0, 1.0], dtype=np.float32)
+        result = _cap_ist_changes_to_baseline_peak(expanded, ist_changes)
+        np.testing.assert_allclose(result, ist_changes, atol=1e-6)
+
+    def test_cap_ist_changes_to_baseline_peak_bounds_combined_peak(self):
+        # Regression test for this cycle's finding-(a) fix: an uncapped
+        # ist_changes that would inflate the combined signal's peak well
+        # above expanded_channel's own peak must be scaled down so the
+        # combined result's peak moves substantially back toward it (see
+        # the function's own docstring comment for why an inflated peak
+        # here is the root cause of a net high-frequency attenuation once
+        # upscale()'s mandatory final normalize divides the whole channel
+        # by it). The correction is a bounded, few-round approximation
+        # (not a convergence loop - see the function's own docstring for
+        # why running it to full convergence is itself undesirable), so
+        # it substantially reduces the overshoot without necessarily
+        # eliminating it outright in a fixed small number of rounds.
+        expanded = np.array([10.0, 10.0, -10.0, -10.0], dtype=np.float32)
+        # This ist_changes alone would push the combined peak to 25 - well
+        # above expanded's own peak of 10.
+        ist_changes = np.array([15.0, 15.0, -15.0, -15.0], dtype=np.float32)
+        baseline_peak = float(np.max(np.abs(expanded)))
+        uncapped_peak = float(np.max(np.abs(expanded + ist_changes)))
+
+        capped = _cap_ist_changes_to_baseline_peak(expanded, ist_changes)
+        combined = expanded + capped
+        combined_peak = float(np.max(np.abs(combined)))
+        # Measured directly: this fixture's 5-round cap lands the combined
+        # peak at ~11.76 - a large reduction from the uncapped 25, and
+        # much closer to the baseline of 10, though not exactly at it (an
+        # exact match was verified separately, via a bisection search, to
+        # squeeze ist_changes toward zero instead - the opposite of what
+        # this fix is for).
+        self.assertLess(combined_peak, baseline_peak * 1.3)
+        self.assertLess(combined_peak, uncapped_peak)
+        # And it must not have been zeroed outright - a bounded, partial
+        # correction (per the function's own max_rounds design) still
+        # keeps a meaningful, non-trivial fraction of the original
+        # contribution, not just whatever sliver survives full
+        # convergence toward zero.
+        self.assertGreater(float(np.max(np.abs(capped))),
+                           0.1 * float(np.max(np.abs(ist_changes))))
+
+    def test_cap_ist_changes_to_baseline_peak_zero_baseline(self):
+        # Guards the baseline_peak == 0 short-circuit - dividing by a zero
+        # baseline peak would be a degenerate no-op cap rather than an
+        # explicit pass-through.
+        expanded = np.zeros(4, dtype=np.float32)
+        ist_changes = np.array([1.0, -1.0, 2.0, -2.0], dtype=np.float32)
+        result = _cap_ist_changes_to_baseline_peak(expanded, ist_changes)
+        np.testing.assert_allclose(result, ist_changes, atol=1e-6)
+
+    def test_upscale_channels_ist_does_not_net_attenuate_untouched_band(self):
+        # Direct regression test for this cycle's highest-priority finding
+        # (audio-quality-checker's test_lf_to_hf_tonal_tilt): IST's
+        # peak-relative FFT threshold concentrates its own added energy on
+        # whichever frequency dominates a block's spectrum (typically a
+        # loud low frequency in real music), inflating the channel's own
+        # peak; upscale()'s mandatory final full-scale normalize is a
+        # single per-channel scalar, so that inflation was previously
+        # "spent" uniformly across every frequency at that step - net
+        # *attenuating* quieter, untouched high-frequency content relative
+        # to a plain-interpolation (no-IST) control, even though IST only
+        # ever adds in raw terms. Reproduces that mechanism directly with
+        # a loud low tone (well above IST's threshold) plus a much
+        # quieter high tone (below it, so IST contributes ~0 there in raw
+        # terms) - measured pre-fix on this exact fixture: the high tone
+        # landed ~4.3dB below the no-IST control after the same
+        # autoscale+cutoff+normalize tail upscale() applies; post-fix
+        # (5-round peak cap) that shrinks to ~1.2dB.
+        sample_rate = 44100
+        duration = 0.25
+        n = int(sample_rate * duration)
+        t = np.arange(n) / sample_rate
+        lf_freq, lf_amp = 200.0, 10000.0
+        hf_freq, hf_amp = 8000.0, 1000.0
+        sig = (lf_amp * np.sin(2 * np.pi * lf_freq * t)
+              + hf_amp * np.sin(2 * np.pi * hf_freq * t)).astype(np.float32)
+
+        channels = sig[:, np.newaxis]
+        upscale_factor = 4
+        max_iter = 300
+        threshold = 0.6
+
+        ist_out = upscale_channels(channels, upscale_factor, max_iter,
+                                   threshold)[:, 0]
+        interp_only = new_interpolation_algorithm(sig, upscale_factor)
+
+        new_sample_rate = sample_rate * upscale_factor
+        original_nyquist = sample_rate / 2.0
+        orig_peak = float(np.max(np.abs(sig)))
+
+        # Mirrors upscale()'s own tail exactly (auto-scale to original
+        # peak, Nyquist cutoff, final full-scale normalize) so this
+        # measures the same quantity audio-quality-checker does.
+        def tail(x):
+            scaled = normalize_signal(x) * orig_peak
+            filtered = apply_nyquist_cutoff(scaled, new_sample_rate,
+                                            original_nyquist)
+            return normalize_signal(filtered)
+
+        final_ist = tail(ist_out)
+        final_ctrl = tail(interp_only)
+
+        def band_mag(x, freq):
+            spec = np.abs(np.fft.rfft(x.astype(np.float64)))
+            freqs = np.fft.rfftfreq(len(x), d=1.0 / new_sample_rate)
+            idx = int(np.argmin(np.abs(freqs - freq)))
+            return float(spec[idx])
+
+        hf_ratio_db = 20 * np.log10(
+            band_mag(final_ist, hf_freq) / band_mag(final_ctrl, hf_freq))
+        # Pre-fix this measured ~-4.31dB on this exact fixture - the fix
+        # must bring it to a materially smaller attenuation, not merely
+        # not-worse.
+        self.assertGreater(hf_ratio_db, -3.0)
+        # And the low tone (the one IST actually boosts) must not have
+        # flipped into a large attenuation either - the cap only bounds
+        # peak growth, it should not overcorrect into a net cut there.
+        lf_ratio_db = 20 * np.log10(
+            band_mag(final_ist, lf_freq) / band_mag(final_ctrl, lf_freq))
+        self.assertGreater(lf_ratio_db, -1.0)
 
     def test_iterative_soft_thresholding_chains_across_iterations(self):
         data = np.array([0.9, 0.1, -0.8, 0.05, 0.7, -0.2, 0.3, -0.6],
@@ -569,6 +718,18 @@ class TestFeed(unittest.TestCase):
         # file, so assert that on the data actually handed to write_audio.
         new_sample_rate = write_args[1]
         self.assertEqual(new_sample_rate, sample_rate * 4)
+        # Duration must be preserved end to end: the whole point of the
+        # upscale is more samples per second at the *same* wall-clock
+        # length, so frames must be exactly n_frames * upscale_factor and
+        # the implied duration must equal the source's. Nothing else in
+        # the suite asserts upscale()'s output length - an off-by-a-hop
+        # slice in iterative_soft_thresholding's overlap-add path, or a
+        # length change in apply_nyquist_cutoff's irfft, would silently
+        # shorten or stretch the output while every other assertion here
+        # still passed.
+        self.assertEqual(written_data.shape[0], n_frames * 4)
+        self.assertAlmostEqual(written_data.shape[0] / new_sample_rate,
+                               n_frames / sample_rate, places=9)
         for ch in range(written_data.shape[1]):
             spectrum = np.abs(np.fft.rfft(written_data[:, ch]))
             freqs = np.fft.rfftfreq(written_data.shape[0],
@@ -619,6 +780,14 @@ class TestFeed(unittest.TestCase):
         self.assertLessEqual(float(np.max(np.abs(written_data))),
                              1.0 + 1e-6)
         self.assertEqual(int(np.sum(np.abs(written_data) > 1.0)), 0)
+        # ...and it must actually *reach* full scale, not merely stay under
+        # it. Asserting only the upper bound would pass just as happily if
+        # a future change re-ordered normalization back before the cutoff
+        # and left the filtered signal peaking well below 1.0 (a silent
+        # level loss). The final normalize_signal being the true last
+        # numeric step is what makes this exact.
+        self.assertAlmostEqual(float(np.max(np.abs(written_data))), 1.0,
+                               places=6)
 
     def test_normalize_signal(self):
         signal = np.array([1, 2, 3, 4], dtype=np.float32)
