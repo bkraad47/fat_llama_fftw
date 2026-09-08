@@ -83,10 +83,10 @@ expanded = new_interpolation_algorithm(channel, upscale_factor=4)
 ### `initialize_ist(data, threshold) -> np.ndarray`
 **File:** fat_llama_fftw/audio_fattener/feed.py:74
 **Kind:** function
-**Description:** First IST step: zeroes out every sample whose magnitude is at/below `threshold`, keeping only values already above it as the starting point for the FFT-domain refinement loop.
+**Description:** First IST step: zeroes out every sample whose magnitude is at/below `threshold * peak(data)`, keeping only values already above that as the starting point for the FFT-domain refinement loop. Cycle-2 fix: `threshold` is now a fraction (0-1) of the array's own peak magnitude rather than an absolute cutoff — the old absolute comparison kept ~99.8% of raw int16-scale samples at the default `0.6`, making IST a near-identity with no added detail. Returns an all-zero array (via an explicit `peak == 0` guard) for a silent input.
 **Parameters:**
 - `data` (`np.ndarray`): input samples (typically the interpolated/expanded channel).
-- `threshold` (`float`): magnitude cutoff.
+- `threshold` (`float`): fraction of `data`'s own peak magnitude to use as the cutoff.
 **Returns:** `np.ndarray` — same shape as `data`, thresholded.
 **Usage:**
 ```python
@@ -94,12 +94,12 @@ data_thres = initialize_ist(expanded_channel, threshold=0.6)
 ```
 
 ### `perform_ist_iteration(data_thres, threshold) -> np.ndarray`
-**File:** fat_llama_fftw/audio_fattener/feed.py:80
+**File:** fat_llama_fftw/audio_fattener/feed.py:87
 **Kind:** function
-**Description:** One IST refinement pass: FFT the current estimate (via `pyfftw.interfaces.numpy_fft`), zero out frequency bins at/below `threshold`, inverse-FFT back to the time domain, and keep the real part. This is the core FFT/IST step described in README's "Why FFT and IST?" and `.claude/rules/project-mission.md`.
+**Description:** One IST refinement pass: FFT the current estimate (via `pyfftw.interfaces.numpy_fft`), zero out frequency bins at/below `threshold * peak(|FFT|)`, inverse-FFT back to the time domain, and keep the real part. This is the core FFT/IST step described in README's "Why FFT and IST?" and `.claude/rules/project-mission.md`. Cycle-2 fix: thresholds relative to the current FFT magnitude's own peak (same rationale as `initialize_ist`), with an explicit `fft_peak == 0` guard.
 **Parameters:**
 - `data_thres` (`np.ndarray`): current time-domain estimate.
-- `threshold` (`float`): frequency-domain magnitude cutoff.
+- `threshold` (`float`): fraction of the current FFT magnitude's own peak to use as the cutoff.
 **Returns:** `np.ndarray` — refined time-domain estimate (real-valued).
 **Usage:**
 ```python
@@ -256,8 +256,32 @@ python -m unittest discover -s fat_llama_fftw/tests
 **Description:** New in cycle 1. Constructs a zero-order-hold-imaged tone (via `new_interpolation_algorithm`) and verifies `apply_nyquist_cutoff` reduces energy above the original Nyquist to <0.01% of its pre-filter value while in-band energy survives.
 **Returns:** `None` (assertion-based).
 
+### `TestFeed.test_initialize_ist_scales_with_data_magnitude(self)`
+**File:** fat_llama_fftw/tests/test_feed.py:99
+**Kind:** method
+**Description:** New in cycle 2 — regression test for the absolute-vs-relative threshold bug. Verifies the same fractional `threshold` keeps the same *proportion* of samples regardless of the data's absolute numeric scale (small-scale array vs. the same array x8192, i.e. int16-range), and that int16-scale data isn't simply "keep everything" (the actual pre-fix bug).
+**Returns:** `None` (assertion-based).
+
+### `TestFeed.test_initialize_ist_zero_signal_stays_zero(self)`
+**File:** fat_llama_fftw/tests/test_feed.py:119
+**Kind:** method
+**Description:** New in cycle 2 — guards the `peak == 0` short-circuit added for the relative-threshold fix.
+**Returns:** `None` (assertion-based).
+
+### `TestFeed.test_ist_adds_content_distinct_from_input_at_realistic_scale(self)`
+**File:** fat_llama_fftw/tests/test_feed.py:202
+**Kind:** method
+**Description:** New in cycle 2 — the direct regression test for the "no measurable added detail" finding. On an int16-scale synthetic signal, asserts `iterative_soft_thresholding`'s output is finite, non-zero, and differs from the input by more than 5% of the input's peak (the pre-fix bug's signature was landing within ~1.95e-3 of the input's own peak — an effective no-op).
+**Returns:** `None` (assertion-based).
+
+### `TestFeed.test_upscale_wires_apply_nyquist_cutoff(self, mock_read_audio, mock_write_audio)`
+**File:** fat_llama_fftw/tests/test_feed.py:264
+**Kind:** method
+**Description:** New in cycle 2 — end-to-end regression test (mocked I/O) proving `upscale()` itself calls `apply_nyquist_cutoff` once per channel with the correct upscaled sample rate and original Nyquist, and that the filtered result is what actually gets written — closes the cycle-1 gap where the cutoff was only unit-tested in isolation.
+**Returns:** `None` (assertion-based).
+
 ### `TestFeed.test_normalize_signal(self)`
-**File:** fat_llama_fftw/tests/test_feed.py:177
+**File:** fat_llama_fftw/tests/test_feed.py:313
 **Kind:** method
 **Description:** Verifies peak-normalization divides by the max absolute value, plus (cycle-1 strengthening) that the result peaks at exactly 1.0 and stays within `[-1, 1]`.
 **Returns:** `None` (assertion-based).
@@ -327,7 +351,9 @@ compare_signals(mp3, flac, sr1)
 ## Open items / observations
 
 - **Fixed in cycle 1:** `iterative_soft_thresholding`'s non-chaining `ThreadPoolExecutor` loop (was equivalent to always running a single IST pass regardless of `max_iter`) — now a real sequential loop with a convergence early-exit. **Fixed in cycle 1:** no FFT-domain cutoff above the original Nyquist frequency — `apply_nyquist_cutoff` now runs as `upscale()`'s final stage.
-- **Still open, deferred by generate-code to a future cycle:** no measurable added detail below the original Nyquist frequency — the output currently tracks the MP3 source's own spectral levels closely rather than reconstructing missing/congested detail (a "transparent pass-through," per `audio-quality-checker`'s cycle-1 report). A real fix likely needs a bandlimited interpolation method and/or reshaping how IST's thresholded residual is added back — flagged as a separate, larger DSP change deserving its own hypothesis-driven cycle.
+- **Fixed in cycle 2:** no measurable added detail below the original Nyquist frequency — root-caused to `threshold_value` being compared as an absolute cutoff against raw int16-scale magnitudes (keeping ~99.8% of samples, a near-identity). `initialize_ist`/`perform_ist_iteration` now threshold relative to each domain's own current peak magnitude instead. **Fixed in cycle 2:** `upscale()`'s wiring to `apply_nyquist_cutoff` is now covered by an end-to-end mocked-I/O test (previously only unit-tested in isolation).
 - **Still open, out of `generate-code`'s write scope:** `analysis.py` (repo root, outside `fat_llama_fftw/**`) still imports `cupy` (GPU-only) despite this package being the CPU/FFTW-only variant.
 - **Still open, out of scope for any skill/agent to edit directly:** `upscale()`'s actual signature has no `toggle_normalize`/`toggle_autoscale`/`toggle_adaptive_filter` flags and `feed.py` has no `lms_filter` function — `.claude/agents/rules/audio-quality.md`'s pinned baseline config and runtime-estimate section reference these anyway (apparently carried over from the CUDA sibling package's more elaborate `feed.py`). Needs a human or a future permitted `.claude/` edit to reconcile.
-- No test exercises `upscale()` end-to-end — coverage is still per-helper-function only, per `audio-quality-checker`'s cycle-1 `test_test_coherence_review` finding.
+- **Still open, methodology/human decision, not a source bug:** the repo-root reference asset `input_test.flac` is itself a stale output of this same pipeline from *before* the cycle-1 Nyquist-cutoff fix, so it still carries above-Nyquist imaging — `audio-quality-checker`'s spectral-deviation score partly measures agreement with this defective reference rather than fidelity to an independent lossless master. Regenerating it needs a human/methodology decision (e.g. sourcing a true lossless master), not a `generate-code` edit.
+- **Still open, environment issue, not a source bug:** a stale `pip install`-ed copy of `fat_llama_fftw` exists in this environment's `venv/Lib/site-packages/`, which can shadow the working tree's own package when a script is run with the working tree not first on `sys.path` — `audio-quality-checker` hit this on its first cycle-2 attempt (silently ran pre-fix code). Needs `pip install -e .` / reinstall in this environment; not a file for any skill/agent to edit.
+- `upscale()` end-to-end coverage is now present (`test_upscale_wires_apply_nyquist_cutoff`, cycle 2) but only for the Nyquist-cutoff wiring specifically — no test yet exercises the full `upscale()` call against a real (or fully synthetic) audio file end-to-end for output correctness generally.

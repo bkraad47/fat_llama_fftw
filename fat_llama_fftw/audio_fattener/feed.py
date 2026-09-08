@@ -14,6 +14,12 @@ from mutagen.wave import WAVE
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Cache pyfftw's planned transforms so repeated same-shape calls (the
+# per-block IST loop below calls perform_ist_iteration/initialize_ist many
+# times against a fixed block size) reuse a cached FFTW plan instead of
+# re-planning from scratch on every call.
+pyfftw.interfaces.cache.enable()
+
 
 def read_audio(file_path, format):
     if not os.path.exists(file_path):
@@ -101,13 +107,24 @@ def perform_ist_iteration(data_thres, threshold):
     if fft_peak == 0:
         return np.zeros_like(data_thres, dtype=np.float64)
     mask = np.abs(data_fft) > threshold * fft_peak
+    # The DC bin (index 0) carries no spectral detail - only a constant
+    # offset - so it is never a legitimate IST "kept frequency" and must be
+    # excluded outright, regardless of whether it individually clears the
+    # peak-relative threshold. In practice it often does clear it: any
+    # asymmetric transient content (e.g. a kick-drum-like spike whose
+    # positive excursion outweighs its negative one) concentrates a large
+    # share of the block's broadband energy at bin 0, sometimes making it
+    # the single loudest bin. Keeping it would inject that as a literal DC
+    # offset into ist_changes, which upscale_channels adds onto the whole
+    # channel (root cause of a cycle-2 regression: +41.7 dB DC offset plus
+    # a low-frequency drone measured across an entire 15s output file).
+    mask[0] = False
     data_fft_thres = np.where(mask, data_fft, 0)
     data_thres = pyfftw.interfaces.numpy_fft.ifft(data_fft_thres).real
     return data_thres
 
 
-def iterative_soft_thresholding(data, max_iter, threshold,
-                                convergence_tol=1e-6):
+def _ist_chain(data, max_iter, threshold, convergence_tol):
     # Each IST pass must refine the *previous* pass's own estimate - that
     # sequential dependency is the algorithm (see README's "Why FFT and
     # IST?" and project-mission.md). A ThreadPoolExecutor that submits all
@@ -138,6 +155,63 @@ def iterative_soft_thresholding(data, max_iter, threshold,
             break
 
     return data_thres
+
+
+def iterative_soft_thresholding(data, max_iter, threshold,
+                                convergence_tol=1e-6, block_size=8192):
+    # Cycle-2 root cause (found by audio-quality-checker in cycle 3):
+    # thresholding the *whole file* against a single global FFT peak means
+    # "within threshold of the loudest bin" is dominated by whichever
+    # single moment/frequency is loudest across the entire signal - a real
+    # music file's dynamic range spans ~60-100 dB, so essentially nothing
+    # outside that one loud moment ever clears the cutoff, leaving other
+    # frequency bands with no measurable added detail. Below block_size
+    # samples this still runs as a single whole-signal chain (unchanged
+    # behavior, and the common case for short test/synthetic inputs).
+    # Above it, process the signal as 50%-overlapping, Hann-windowed
+    # blocks (STFT-style) and overlap-add the results: the peak-relative
+    # threshold in perform_ist_iteration/initialize_ist then reflects each
+    # block's own local dynamics, so quieter passages/bands get a
+    # meaningful cutoff relative to themselves instead of being judged
+    # against the whole file's single loudest partial. This still stays
+    # within the FFT/IST method (no new mechanism, just where each FFT's
+    # window boundary sits) and each block's own hard-threshold fixed
+    # point is found independently, so this does not reintroduce the
+    # cycle-1 non-chaining bug or lose its convergence early-exit.
+    n = len(data)
+    if n <= block_size:
+        return _ist_chain(data, max_iter, threshold, convergence_tol)
+
+    hop = block_size // 2
+    # Periodic (DFT-even) Hann window: exact constant-overlap-add at 50%
+    # hop (adjacent windows sum to a flat 1.0), which both tapers each
+    # block's contribution smoothly to ~0 at its own edges (avoiding
+    # audible block-boundary discontinuities in the additive ist_changes
+    # signal) and keeps the overlap-add's net gain close to unity without
+    # needing a second, nonlinear-output normalization pass.
+    window = 0.5 - 0.5 * np.cos(2 * np.pi * np.arange(block_size) / block_size)
+
+    pad = hop
+    padded = np.concatenate([
+        np.zeros(pad, dtype=np.float64),
+        np.asarray(data, dtype=np.float64),
+        np.zeros(block_size, dtype=np.float64),
+    ])
+    padded_len = len(padded)
+
+    output = np.zeros(padded_len, dtype=np.float64)
+    weight = np.zeros(padded_len, dtype=np.float64)
+    for start in range(0, padded_len - block_size + 1, hop):
+        frame = padded[start:start + block_size] * window
+        frame_result = _ist_chain(frame, max_iter, threshold,
+                                  convergence_tol)
+        output[start:start + block_size] += frame_result
+        weight[start:start + block_size] += window
+
+    safe_weight = np.where(weight > 1e-8, weight, 1.0)
+    output = output / safe_weight
+
+    return output[pad:pad + n].astype(np.float32)
 
 
 def upscale_channels(channels, upscale_factor, max_iter, threshold):

@@ -125,28 +125,66 @@ class TestFeed(unittest.TestCase):
         np.testing.assert_array_equal(output, np.zeros(5))
 
     def test_upscale_channels(self):
+        # threshold must be a *fraction* of peak magnitude (cycle-2
+        # semantics). This test previously passed threshold=2.5, which
+        # under fractional semantics means 250% of peak - nothing survives
+        # thresholding, IST contributes exactly zero, and the test silently
+        # degenerated into a duplicate of
+        # test_upscale_channels_thresholded_out_is_pure_interpolation while
+        # its only remaining assertion (a loose "within 4x the source peak"
+        # bound) passed trivially. Use an in-range threshold so the
+        # IST-contributing path is actually exercised, and assert the exact
+        # expected samples rather than a bound.
+        #
+        # Cycle-3 fix: perform_ist_iteration now always excludes the FFT's
+        # DC bin (index 0) from surviving thresholding (see its own
+        # docstring comment - a cycle-2 regression let DC dominate the
+        # kept mask for asymmetric/transient content, injecting a literal
+        # DC offset into ist_changes). For this array
+        # (interpolated to [1,1,3,3] per channel), initialize_ist keeps
+        # only the loud half [0,0,3,3], whose FFT is [6, -3+3i, 0, -3-3i];
+        # excluding bin 0 leaves only the conjugate pair (bins 1 and 3),
+        # whose ifft is the new fixed point [-1.5,-1.5,1.5,1.5] - a
+        # different, DC-free result than the old (DC-inclusive) fixed
+        # point, with the same 1.5x-of-source-peak scale-invariant relationship
+        # for both channels since peak-relative thresholding scales with
+        # the input.
         channels = np.array([[1, 2], [3, 4]], dtype=np.float32)
         upscale_factor = 2
-        threshold = 2.5
+        threshold = 0.6
         max_iter = 10
         output = upscale_channels(channels, upscale_factor, max_iter,
                                   threshold)
         self.assertEqual(output.shape, (4, 2))
         # Output must be usable audio, not NaN/Inf.
         self.assertTrue(np.all(np.isfinite(output)))
+        expected = np.array([[-0.5, 0], [-0.5, 0], [4.5, 6], [4.5, 6]],
+                            dtype=np.float32)
+        np.testing.assert_allclose(output, expected, atol=1e-6)
+        # IST must have contributed something here - otherwise this test
+        # would be indistinguishable from pure interpolation.
+        interpolated = np.array([[1, 2], [1, 2], [3, 4], [3, 4]],
+                                dtype=np.float32)
+        self.assertGreater(float(np.max(np.abs(output - interpolated))), 0.0)
         # Column order must be preserved: column i still derives from
-        # channel i, so each column must stay within its own source
-        # channel's dynamic range.
+        # channel i, so each column stays proportional to its own source
+        # channel and never picks up the other channel's values. The
+        # DC-free fixed point's peak lands at 1.5x each channel's own
+        # source peak (scale-invariant, since peak-relative thresholding
+        # produces a proportional result regardless of the input's
+        # absolute scale).
         for i, src in enumerate(channels.T):
-            self.assertLessEqual(np.max(np.abs(output[:, i])),
-                                 np.max(np.abs(src)) * 4.0)
+            self.assertAlmostEqual(float(np.max(np.abs(output[:, i]))),
+                                   1.5 * float(np.max(np.abs(src))),
+                                   places=5)
 
     def test_upscale_channels_thresholded_out_is_pure_interpolation(self):
-        # With a threshold above every sample, IST contributes exactly zero,
-        # so the result must be the zero-order-hold interpolation of the input.
+        # threshold is a fraction of peak magnitude, so any value > 1.0
+        # sits above every sample: IST contributes exactly zero and the
+        # result must be the zero-order-hold interpolation of the input.
         channels = np.array([[1, 2], [3, 4]], dtype=np.float32)
         output = upscale_channels(channels, upscale_factor=2, max_iter=5,
-                                  threshold=100.0)
+                                  threshold=1.5)
         expected = np.array([[1, 2], [1, 2], [3, 4], [3, 4]], dtype=np.float32)
         np.testing.assert_allclose(output, expected, atol=1e-6)
 
@@ -227,6 +265,107 @@ class TestFeed(unittest.TestCase):
         # of the input's own peak.
         max_diff = np.max(np.abs(ist_changes - sig))
         self.assertGreater(max_diff, 0.05 * np.max(np.abs(sig)))
+
+    def test_perform_ist_iteration_never_keeps_dc_bin(self):
+        # Regression test for the cycle-2 DC-offset regression found by
+        # audio-quality-checker in cycle 3 (+41.7 dB DC offset vs. the
+        # reference on a real 15s output file). Root cause: asymmetric,
+        # transient-heavy content (e.g. a kick-drum-like spike whose
+        # positive excursion outweighs its negative one) concentrates a
+        # large share of broadband energy at FFT bin 0 (DC) - sometimes
+        # enough to make it the single loudest bin, which the old
+        # peak-relative threshold then kept outright. perform_ist_iteration
+        # must now always zero the DC bin regardless of its magnitude.
+        rng = np.random.default_rng(3)
+        n = 4000
+        sig = (2000 * rng.standard_normal(n)).astype(np.float64)
+        spike_idx = rng.choice(n, size=3, replace=False)
+        sig[spike_idx] += rng.uniform(15000, 30000, size=3)
+
+        data_thres = initialize_ist(sig, 0.6)
+        # Confirm this input actually reproduces the bug's precondition -
+        # the DC bin must be at (or very near) the loudest bin in the raw,
+        # un-fixed FFT, otherwise this isn't exercising the regression.
+        raw_fft = np.fft.fft(data_thres)
+        self.assertAlmostEqual(
+            float(np.abs(raw_fft[0])), float(np.max(np.abs(raw_fft))),
+            delta=1e-6 * float(np.max(np.abs(raw_fft)))
+        )
+
+        result = perform_ist_iteration(data_thres, 0.6)
+        result_fft = np.fft.fft(result)
+        # DC must be exactly excluded, not just reduced.
+        self.assertAlmostEqual(float(np.abs(result_fft[0])), 0.0, places=6)
+        # And the pass must still have kept other content (not degenerated
+        # into an all-zero no-op by removing the one bin that dominated).
+        self.assertGreater(np.max(np.abs(result)), 0)
+
+    def test_iterative_soft_thresholding_output_has_no_dc_offset(self):
+        # End-to-end version of the DC regression, through the public
+        # iterative_soft_thresholding entry point (long enough - above
+        # the default block_size - to also exercise the blocked/windowed
+        # path, since each block's own DC bin must stay excluded too).
+        rng = np.random.default_rng(3)
+        n = 40000
+        sig = (2000 * rng.standard_normal(n)).astype(np.float64)
+        spike_idx = rng.choice(n, size=6, replace=False)
+        sig[spike_idx] += rng.uniform(15000, 30000, size=6)
+
+        ist_changes = iterative_soft_thresholding(sig, max_iter=50,
+                                                   threshold=0.6)
+        self.assertTrue(np.all(np.isfinite(ist_changes)))
+        peak = np.max(np.abs(ist_changes))
+        self.assertGreater(peak, 0)
+        # The old (pre-fix) whole-file behavior put the DC bin at the very
+        # top of the kept mask (see test_perform_ist_iteration_never_keeps_
+        # dc_bin) - the fixed output's own mean, relative to its peak
+        # amplitude, must be far below the cycle-2 regression's measured
+        # +1.9897e-3 (-54.0 dBFS) offset.
+        relative_dc = abs(float(np.mean(ist_changes))) / peak
+        self.assertLess(relative_dc, 1e-3)
+
+    def test_iterative_soft_thresholding_blocks_restore_multiple_bands(self):
+        # Regression test for the cycle-2/cycle-3 "no measurable added
+        # detail" finding: a single whole-file peak-relative threshold is
+        # dominated by whichever moment/frequency is loudest across the
+        # entire signal, so quieter bands never clear it. This signal has
+        # one loud low-frequency segment and three much quieter
+        # higher-frequency segments (realistic dynamic range, ~20 dB
+        # down) spanning multiple block_size-sized blocks; with localized
+        # (blocked) thresholding each segment's own local peak should let
+        # its own dominant frequency survive, not just the loudest one.
+        n = 40000
+        t = np.arange(n) / 44100.0
+        seg = n // 4
+        sig = np.zeros(n, dtype=np.float64)
+        freqs = [300, 1500, 5000, 9000]
+        amps = [30000, 3000, 2800, 2500]
+        for i, (f, a) in enumerate(zip(freqs, amps)):
+            s = i * seg
+            e = (i + 1) * seg if i < 3 else n
+            sig[s:e] = a * np.sin(2 * np.pi * f * t[s:e])
+
+        ist_changes = iterative_soft_thresholding(sig, max_iter=50,
+                                                   threshold=0.6)
+        self.assertTrue(np.all(np.isfinite(ist_changes)))
+
+        spectrum = np.abs(np.fft.rfft(ist_changes.astype(np.float64)))
+        freq_axis = np.fft.rfftfreq(n, d=1.0 / 44100.0)
+        peak = np.max(spectrum)
+        magnitudes = []
+        for f in freqs:
+            idx = int(np.argmin(np.abs(freq_axis - f)))
+            magnitudes.append(spectrum[idx])
+
+        # Every one of the four bands - not just the loudest segment's -
+        # must show measurable restored energy (at least 1% of the
+        # overall peak). The pre-fix whole-file threshold left the three
+        # quieter bands at ~0 (verified directly against the current
+        # source in this same scenario: 1500/5000/9000 Hz all landed
+        # below 1e-3 magnitude against a peak in the hundreds of millions).
+        for f, mag in zip(freqs, magnitudes):
+            self.assertGreater(mag, 0.01 * peak,
+                              f"{f} Hz band shows no measurable added detail")
 
     def test_apply_nyquist_cutoff_removes_image_content(self):
         original_sample_rate = 8000
