@@ -23,3 +23,72 @@ Five-cycle `iterate-fat-llama` run focused on upscale pipeline performance and a
 - `analysis.py` (the standalone spectrogram/comparison script) still imports `cupy`, a GPU dependency this now-CPU-only package doesn't otherwise use — it will fail to import as-is in a plain CPU environment.
 - `.claude/agents/rules/audio-quality.md`'s documented baseline test configuration references parameters (`toggle_normalize`, `toggle_autoscale`, `toggle_adaptive_filter`) that don't exist on `upscale()`'s actual signature — a leftover from this package's CUDA sibling project. Needs a human edit to reconcile.
 - `README.md`'s Algorithm Explanation section hasn't been updated to describe the block/windowed IST processing and DC-bin exclusion added this run.
+
+
+### [1.0.3] - [1.0.4] - 2024-07-26
+
+#### Changed
+
+- Moved to `pyfftw` from CUDA.
+
+### [1.0.2] - 2024-07-26
+
+#### Changed
+
+- Remove `logging` from requirements to fix pip bug.
+
+### [1.0.1] - 2024-07-26
+
+#### Changed
+
+- Updated `analytics.py` analysis and spectorgram results.
+- Updated `README.md` details.
+
+### [1.0.0] - 2024-07-25
+
+#### Added
+
+- Added support for reading 'ogg', 'flac', and 'wav' file formats and calculating their bitrates correctly.
+
+#### Changed
+
+- Renamed `upscale_mp3_to_flac` method to `upscale` to support multiple source formats.
+- Simplified the workflow to focus on 'mp3' to 'flac' conversion with essential steps only.
+
+#### Removed
+
+- Dropped support for 'ape' and 'alac' target formats.
+
+### [0.1.8] - 2024-07-24
+
+#### Added
+
+- Introduced toggle flags for normalization, equalization, amplitude scaling, and gain reduction.
+- Enhanced auto-scaling of amplitude based on the original MP3 file when `toggle_scale_amplitude` is `False`.
+- Logging for each step of the processing to provide better traceability and debugging.
+
+#### Changed
+
+- Default values for parameters are now set at the function call.
+- Refined the upscaling algorithm to ensure better handling of amplitude and gain.
+- Renamed the flags for consistency (`toggle_wiener_filter`, `toggle_normalize`, `toggle_equalize`, `toggle_scale_amplitude`, `toggle_gain_reduction`).
+
+#### Fixed
+
+- Fixed issues related to numpy and cupy array conversions.
+- Improved error handling for invalid target bitrate values.
+- Addressed the issue where the amplitude of the produced signal was significantly weaker than the original.
+
+### [0.1.7] - 2024-07-22
+
+#### Added
+
+- Added methods for MP3 to FLAC conversion with optional processing using CuPy for GPU acceleration.
+- Initial version of `upscale_mp3_to_flac` method with parameters for iterative soft thresholding (IST), gain reduction, and equalization.
+
+### [0.1.0] to [0.1.6] - 2024-07-20
+
+#### Added
+
+- Basic functionality for reading MP3 files and writing FLAC files.
+- Initial implementation of the new interpolation algorithm and IST for audio processing.

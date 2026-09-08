@@ -70,7 +70,7 @@ write_audio('output_test.flac', 44100, upscaled_samples, 'flac')
 ### `new_interpolation_algorithm(data, upscale_factor) -> np.ndarray`
 **File:** fat_llama_fftw/audio_fattener/feed.py:60
 **Kind:** function
-**Description:** Zero-order-hold upsampling: repeats each input sample `upscale_factor` times in a plain Python double loop to expand the signal length, ahead of IST refinement. This is the interpolation step named in README's Algorithm Explanation step 3. Being zero-order-hold, it images the original spectrum above the original Nyquist frequency — that's why `upscale()` now runs `apply_nyquist_cutoff` as its final stage (see below).
+**Description:** Zero-order-hold upsampling: repeats each input sample `upscale_factor` times, ahead of IST refinement. This is the interpolation step named in README's Algorithm Explanation step 3. Being zero-order-hold, it images the original spectrum above the original Nyquist frequency — that's why `upscale()` runs `apply_nyquist_cutoff` as a later stage. **Vectorized in this run's cycle 1** — replaced a plain Python double loop with `np.repeat` (bit-for-bit identical output, ~54x measured speedup on a 200k-sample/4x-upscale array; pure performance change).
 **Parameters:**
 - `data` (`np.ndarray`): 1-D channel samples.
 - `upscale_factor` (`int`): how many times to repeat each sample.
@@ -132,6 +132,16 @@ data_thres = perform_ist_iteration(data_thres, threshold=0.6)
 ```python
 ist_changes = iterative_soft_thresholding(expanded_channel, max_iter=300, threshold=0.6)
 ```
+
+### `_cap_ist_changes_to_baseline_peak(expanded_channel, ist_changes, max_rounds=5) -> np.ndarray`
+**File:** fat_llama_fftw/audio_fattener/feed.py (private helper, added this run's cycle 1)
+**Kind:** function
+**Description:** Root-cause fix for a measured high-shelf attenuation (~1.2-5dB net loss above ~1kHz vs. a no-IST control on real programme material): `perform_ist_iteration`'s peak-relative threshold typically boosts a channel's own peak (natural spectra concentrate energy at low frequencies), and since `upscale()`'s auto-scale + final normalize stages are together mathematically inert scalar operations on the final output, that peak inflation isn't "corrected" downstream — it determines how hard *every* frequency (not just what IST touched) gets divided down at final normalization. This function rescales `ist_changes` (bounded, `max_rounds` iterations, never zeroed) so the combined interpolation+IST signal's peak doesn't exceed the pre-IST baseline's peak, without touching `perform_ist_iteration`'s FFT-domain logic or the WOLA reconstruction. Deliberately a *partial* correction (measured: ~65-75% reduction of the attenuation) — full convergence was proven to squeeze `ist_changes` toward zero, reopening the "no measurable added detail" bug from an earlier cycle. Called from `upscale_channels`, immediately after `iterative_soft_thresholding`.
+**Parameters:**
+- `expanded_channel` (`np.ndarray`): the pre-IST interpolated baseline for this channel.
+- `ist_changes` (`np.ndarray`): IST's contribution, as returned by `iterative_soft_thresholding`.
+- `max_rounds` (`int`): bound on correction rounds. Default `5`.
+**Returns:** `np.ndarray` — `ist_changes`, rescaled.
 
 ### `upscale_channels(channels, upscale_factor, max_iter, threshold) -> np.ndarray`
 **File:** fat_llama_fftw/audio_fattener/feed.py:122

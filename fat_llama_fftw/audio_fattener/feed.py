@@ -211,6 +211,7 @@ def iterative_soft_thresholding(data, max_iter, threshold,
     # sum at 50% hop is the flat constant 1.0.
     window = np.sqrt(
         0.5 - 0.5 * np.cos(2 * np.pi * np.arange(block_size) / block_size))
+    window_sum = np.sum(window)
 
     pad = hop
     padded = np.concatenate([
@@ -233,14 +234,32 @@ def iterative_soft_thresholding(data, max_iter, threshold,
         # perfect delta at 0 Hz (Hann/sqrt-Hann has a finite main lobe
         # plus sidelobes). That convolution leaks frame_result's own
         # near-DC (very low frequency) content into the windowed frame's
-        # DC bin, even though frame_result itself has none. Re-zeroing
-        # here removes exactly that reintroduced constant term (bin 0 of
-        # the windowed frame's own spectrum, equivalently its own time-
-        # domain mean) without touching any other frequency the window
-        # preserved, so it does not reopen the cycle-4 edge-taper/click
-        # regression (window shape at the edges is otherwise untouched).
+        # DC bin, even though frame_result itself has none. This needs
+        # correcting, but NOT via a flat scalar subtracted across the
+        # whole block (the cycle-5 fix's original form, `windowed_result -
+        # np.mean(windowed_result)`): by this point the synthesis window
+        # has already tapered windowed_result's own edges to ~0, and a flat
+        # subtraction pushes those edges away from 0 by the raw mean
+        # instead - which is negligible for a stationary single tone (per-
+        # block mean stays ~1e-6 relative to peak there) but not for real,
+        # non-stationary programme material, where a loud/transient
+        # block's mean can be large enough that un-tapering its edges this
+        # way creates a genuine boundary discontinuity at every hop
+        # boundary (root-caused this cycle via direct measurement against
+        # real programme material: boundary-phase-folded |second
+        # difference| landed double-digit dB above the signal's own
+        # typical/median curvature with the flat-scalar form). Instead,
+        # subtract a copy of the correction shaped BY the synthesis window
+        # itself (window * (sum(windowed_result) / sum(window))): its sum
+        # equals sum(windowed_result), so it removes the exact same total
+        # DC/near-DC contribution (verified directly: relative DC stays
+        # many orders of magnitude below the regression bound), but the
+        # correction itself tapers to ~0 at the block's edges just like
+        # windowed_result already does, so it does not un-taper them and
+        # does not reopen the cycle-4 edge-taper/click regression.
         windowed_result = frame_result * window
-        windowed_result = windowed_result - np.mean(windowed_result)
+        windowed_result = windowed_result - window * (
+            np.sum(windowed_result) / window_sum)
         output[start:start + block_size] += windowed_result
         weight[start:start + block_size] += window * window
 
