@@ -3,7 +3,6 @@ import numpy as np
 import scipy.signal as signal
 from pydub import AudioSegment
 import soundfile as sf
-import cupy as cp  # CuPy for GPU acceleration
 
 def read_mp3(file_path):
     audio = AudioSegment.from_mp3(file_path)
@@ -85,12 +84,8 @@ def compare_signals(mp3, flac, sample_rate):
     plt.tight_layout()
     plt.show()
 
-    # 5. Cross-Correlation using GPU
-    mp3_gpu = cp.asarray(mp3)
-    flac_gpu = cp.asarray(flac)
-
-    correlation_gpu = cp.correlate(mp3_gpu, flac_gpu, mode='full')
-    correlation = cp.asnumpy(correlation_gpu)
+    # 5. Cross-Correlation
+    correlation = np.correlate(mp3, flac, mode='full')
     lags = np.arange(-len(mp3) + 1, len(flac))
 
     plt.figure(figsize=(14, 7))
@@ -100,12 +95,9 @@ def compare_signals(mp3, flac, sample_rate):
     plt.title('Cross-correlation between MP3 and FLAC')
     plt.show()
 
-    # 6. Frequency Domain Analysis using cuFFT
-    freq_mp3 = cp.fft.fft(mp3_gpu)
-    freq_flac = cp.fft.fft(flac_gpu)
-
-    freq_mp3 = cp.asnumpy(freq_mp3)
-    freq_flac = cp.asnumpy(freq_flac)
+    # 6. Frequency Domain Analysis
+    freq_mp3 = np.fft.fft(mp3)
+    freq_flac = np.fft.fft(flac)
 
     plt.figure(figsize=(14, 7))
     plt.plot(np.abs(freq_mp3), label='Frequency Content of MP3')
