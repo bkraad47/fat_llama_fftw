@@ -72,14 +72,35 @@ def new_interpolation_algorithm(data, upscale_factor):
 
 
 def initialize_ist(data, threshold):
-    mask = np.abs(data) > threshold
+    # threshold is a fraction (0-1) of this array's own peak magnitude, not
+    # an absolute cutoff - see perform_ist_iteration's docstring-equivalent
+    # comment below for why. A sample survives only if it's within
+    # (1 - threshold) of the loudest sample present.
+    peak = np.max(np.abs(data))
+    if peak == 0:
+        return np.zeros_like(data)
+    mask = np.abs(data) > threshold * peak
     data_thres = np.where(mask, data, 0)
     return data_thres
 
 
 def perform_ist_iteration(data_thres, threshold):
+    # threshold_value is dimensionless (fraction of peak magnitude), scaled
+    # against each domain's own current peak rather than compared directly
+    # to raw magnitudes. Real audio samples/FFT bins are raw int16-range
+    # values (or larger, for FFT bin sums), so comparing a fixed threshold
+    # like the documented default 0.6 straight against them keeps ~100% of
+    # samples/bins - IST degenerates into an fft/ifft identity with no
+    # sparsification, hence no "significant frequencies kept, noise
+    # discarded" and no added detail (see project-mission.md's IST
+    # description and README's "Why FFT and IST?"). Scaling by the current
+    # peak makes the same threshold_value meaningful regardless of the
+    # input's absolute numeric scale.
     data_fft = pyfftw.interfaces.numpy_fft.fft(data_thres)
-    mask = np.abs(data_fft) > threshold
+    fft_peak = np.max(np.abs(data_fft))
+    if fft_peak == 0:
+        return np.zeros_like(data_thres, dtype=np.float64)
+    mask = np.abs(data_fft) > threshold * fft_peak
     data_fft_thres = np.where(mask, data_fft, 0)
     data_thres = pyfftw.interfaces.numpy_fft.ifft(data_fft_thres).real
     return data_thres
