@@ -183,13 +183,35 @@ def iterative_soft_thresholding(data, max_iter, threshold,
         return _ist_chain(data, max_iter, threshold, convergence_tol)
 
     hop = block_size // 2
-    # Periodic (DFT-even) Hann window: exact constant-overlap-add at 50%
-    # hop (adjacent windows sum to a flat 1.0), which both tapers each
-    # block's contribution smoothly to ~0 at its own edges (avoiding
-    # audible block-boundary discontinuities in the additive ist_changes
-    # signal) and keeps the overlap-add's net gain close to unity without
-    # needing a second, nonlinear-output normalization pass.
-    window = 0.5 - 0.5 * np.cos(2 * np.pi * np.arange(block_size) / block_size)
+    # WOLA (weighted overlap-add), not COLA-on-analysis-alone (cycle-4 fix
+    # for a regression found in the previous cycle: a broadband impulse
+    # train locked to this hop rate, ~75 Hz for the tested file). The old
+    # code windowed only the *analysis* side (frame = padded[...] * window)
+    # then overlap-added frame_result un-windowed. COLA (adjacent windows
+    # summing to a flat constant) is only a valid reconstruction argument
+    # for a *linear* per-block operation - windowing the input and trusting
+    # the operation to preserve that taper on the way out. _ist_chain is a
+    # nonlinear hard-threshold projection in the FFT domain: measured
+    # directly (a single stationary tone framed through one block), an
+    # analysis-windowed frame's edges taper to ~1e-4 of its own peak, but
+    # perform_ist_iteration's output has edges back up at ~8-11% of that
+    # frame's own peak - thresholding+ifft does not preserve the input's
+    # time-domain taper. Summing that un-tapered edge content in at full
+    # weight at every hop boundary is exactly the discontinuity that
+    # produces the reported artifact.
+    #
+    # The WOLA fix applies a synthesis window to frame_result too, before
+    # accumulation, so each block's own contribution is forced back down
+    # toward ~0 at its edges regardless of what the nonlinear operation did
+    # there - the discontinuity cannot enter the sum. Perfect reconstruction
+    # of the *linear* overlap-add then requires the analysis*synthesis
+    # window product to itself satisfy COLA at this hop: a plain Hann used
+    # on both sides would not (Hann(n)**2 + Hann(n+hop)**2 is not constant,
+    # only Hann(n) + Hann(n+hop) is), so use sqrt-Hann for both analysis and
+    # synthesis - its square is exactly the plain Hann used before, whose
+    # sum at 50% hop is the flat constant 1.0.
+    window = np.sqrt(
+        0.5 - 0.5 * np.cos(2 * np.pi * np.arange(block_size) / block_size))
 
     pad = hop
     padded = np.concatenate([
@@ -205,8 +227,8 @@ def iterative_soft_thresholding(data, max_iter, threshold,
         frame = padded[start:start + block_size] * window
         frame_result = _ist_chain(frame, max_iter, threshold,
                                   convergence_tol)
-        output[start:start + block_size] += frame_result
-        weight[start:start + block_size] += window
+        output[start:start + block_size] += frame_result * window
+        weight[start:start + block_size] += window * window
 
     safe_weight = np.where(weight > 1e-8, weight, 1.0)
     output = output / safe_weight

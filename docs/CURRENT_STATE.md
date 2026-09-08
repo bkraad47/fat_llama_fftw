@@ -94,11 +94,11 @@ data_thres = initialize_ist(expanded_channel, threshold=0.6)
 ```
 
 ### `perform_ist_iteration(data_thres, threshold) -> np.ndarray`
-**File:** fat_llama_fftw/audio_fattener/feed.py:87
+**File:** fat_llama_fftw/audio_fattener/feed.py:93
 **Kind:** function
-**Description:** One IST refinement pass: FFT the current estimate (via `pyfftw.interfaces.numpy_fft`), zero out frequency bins at/below `threshold * peak(|FFT|)`, inverse-FFT back to the time domain, and keep the real part. This is the core FFT/IST step described in README's "Why FFT and IST?" and `.claude/rules/project-mission.md`. Cycle-2 fix: thresholds relative to the current FFT magnitude's own peak (same rationale as `initialize_ist`), with an explicit `fft_peak == 0` guard.
+**Description:** One IST refinement pass: FFT the current estimate (via `pyfftw.interfaces.numpy_fft`, cached via `pyfftw.interfaces.cache.enable()` at module load), zero out frequency bins at/below `threshold * peak(|FFT|)`, **always also excludes the DC bin (`mask[0] = False`) regardless of whether it clears the threshold** (cycle-3 fix — the DC bin carries only a constant offset, never spectral detail; an asymmetric transient can make it the single loudest raw bin, and keeping it injected a literal DC offset across the whole output, the root cause of a cycle-2 regression), inverse-FFT back to the time domain, and keep the real part.
 **Parameters:**
-- `data_thres` (`np.ndarray`): current time-domain estimate.
+- `data_thres` (`np.ndarray`): current time-domain estimate (one block's worth, when called via the blocked path below).
 - `threshold` (`float`): fraction of the current FFT magnitude's own peak to use as the cutoff.
 **Returns:** `np.ndarray` — refined time-domain estimate (real-valued).
 **Usage:**
@@ -106,15 +106,27 @@ data_thres = initialize_ist(expanded_channel, threshold=0.6)
 data_thres = perform_ist_iteration(data_thres, threshold=0.6)
 ```
 
-### `iterative_soft_thresholding(data, max_iter, threshold, convergence_tol=1e-6) -> np.ndarray`
-**File:** fat_llama_fftw/audio_fattener/feed.py:88
-**Kind:** function
-**Description:** Runs `perform_ist_iteration` in a genuine sequential chain (cycle-1 fix — previously a `ThreadPoolExecutor` submitted all `max_iter` passes concurrently against the same starting `data_thres`, so the result was equivalent to a single iteration regardless of `max_iter`; see `docs/CURRENT_STATE.md`'s prior revision / `.claude/log/generate-code-20260908-203321-bkraad47.log` for the fix). Each pass now feeds its output into the next. Hard-threshold IST is a fixed-point projection (fft/ifft are exact inverses), so the loop also exits early once a pass changes the estimate by less than `convergence_tol` (relative to the estimate's own scale) — measured ~14x wall-clock speedup on `input_test.mp3` at the project's baseline params vs. the pre-fix (non-chaining) version.
+### `_ist_chain(data, max_iter, threshold, convergence_tol) -> np.ndarray`
+**File:** fat_llama_fftw/audio_fattener/feed.py:127
+**Kind:** function (private helper)
+**Description:** New in cycle 3 — factored out of `iterative_soft_thresholding` unchanged: runs `perform_ist_iteration` in a genuine sequential chain (cycle-1 fix — each pass feeds its output into the next; previously a non-chaining `ThreadPoolExecutor` made this equivalent to a single iteration regardless of `max_iter`), with an early exit once a pass changes the estimate by less than `convergence_tol` relative to its own scale (hard-threshold IST is a fixed-point projection, so further passes past that point are provably no-ops). Called either once (short/whole-signal path) or once per block (long-signal blocked path) by `iterative_soft_thresholding`.
 **Parameters:**
-- `data` (`np.ndarray`): input samples for `initialize_ist`.
-- `max_iter` (`int`): upper bound on IST passes; the actual pass count is usually far lower once converged.
-- `threshold` (`float`): magnitude/frequency cutoff used throughout.
+- `data` (`np.ndarray`): input samples (a whole signal or a single block).
+- `max_iter` (`int`): upper bound on passes.
+- `threshold` (`float`): magnitude/frequency cutoff.
+- `convergence_tol` (`float`): relative early-exit tolerance.
+**Returns:** `np.ndarray` — the converged (or `max_iter`-capped) IST estimate.
+
+### `iterative_soft_thresholding(data, max_iter, threshold, convergence_tol=1e-6, block_size=8192) -> np.ndarray`
+**File:** fat_llama_fftw/audio_fattener/feed.py:160
+**Kind:** function
+**Description:** Cycle-3 rewrite. For `len(data) <= block_size`, behaves exactly as before (a single `_ist_chain` call over the whole array — the common case for short test/synthetic inputs). Above `block_size`, splits the signal into 50%-overlapping, periodic-Hann-windowed blocks (STFT-style), runs `_ist_chain` independently on each block (so the peak-relative threshold reflects each block's own *local* dynamics rather than one whole-file global peak), and reconstructs via overlap-add with constant-overlap-add normalization. This is the fix for a cycle-2 regression: thresholding one whole-file FFT against its own global peak meant a real recording's ~60-100 dB dynamic range left almost nothing outside the single loudest moment ever clearing the cutoff, so IST contributed no measurable added detail in other bands. Blocking does not reintroduce the cycle-1 non-chaining bug or lose its convergence early-exit — each block still runs its own full chained/early-exiting `_ist_chain`.
+**Parameters:**
+- `data` (`np.ndarray`): input samples (typically the interpolated/expanded channel).
+- `max_iter` (`int`): upper bound on IST passes per block/chain.
+- `threshold` (`float`): fraction-of-peak magnitude cutoff, applied per-block once above `block_size`.
 - `convergence_tol` (`float`): relative early-exit tolerance. Default `1e-6`.
+- `block_size` (`int`): blocking threshold/window length; not exposed on `upscale()`'s public signature. Default `8192`.
 **Returns:** `np.ndarray` — the IST "changes" to add back onto the interpolated signal (see `upscale_channels`).
 **Usage:**
 ```python
@@ -280,6 +292,24 @@ python -m unittest discover -s fat_llama_fftw/tests
 **Description:** New in cycle 2 — end-to-end regression test (mocked I/O) proving `upscale()` itself calls `apply_nyquist_cutoff` once per channel with the correct upscaled sample rate and original Nyquist, and that the filtered result is what actually gets written — closes the cycle-1 gap where the cutoff was only unit-tested in isolation.
 **Returns:** `None` (assertion-based).
 
+### `TestFeed.test_perform_ist_iteration_never_keeps_dc_bin(self)`
+**File:** fat_llama_fftw/tests/test_feed.py
+**Kind:** method
+**Description:** New in cycle 3 — direct regression test for the DC-bin exclusion fix, using a reproduced asymmetric-transient scenario where the DC bin was the single loudest raw FFT bin pre-fix.
+**Returns:** `None` (assertion-based).
+
+### `TestFeed.test_iterative_soft_thresholding_output_has_no_dc_offset(self)`
+**File:** fat_llama_fftw/tests/test_feed.py
+**Kind:** method
+**Description:** New in cycle 3 — end-to-end regression test (above `block_size`, exercising the blocked path) asserting `iterative_soft_thresholding`'s output carries no DC offset.
+**Returns:** `None` (assertion-based).
+
+### `TestFeed.test_iterative_soft_thresholding_blocks_restore_multiple_bands(self)`
+**File:** fat_llama_fftw/tests/test_feed.py
+**Kind:** method
+**Description:** New in cycle 3 — multi-segment, multi-block synthetic signal asserting all 4 target frequency bands show >1% of peak magnitude after IST (previously 3 of 4 landed at ~0 under the pre-fix whole-file-global threshold).
+**Returns:** `None` (assertion-based).
+
 ### `TestFeed.test_normalize_signal(self)`
 **File:** fat_llama_fftw/tests/test_feed.py:313
 **Kind:** method
@@ -351,7 +381,8 @@ compare_signals(mp3, flac, sr1)
 ## Open items / observations
 
 - **Fixed in cycle 1:** `iterative_soft_thresholding`'s non-chaining `ThreadPoolExecutor` loop (was equivalent to always running a single IST pass regardless of `max_iter`) — now a real sequential loop with a convergence early-exit. **Fixed in cycle 1:** no FFT-domain cutoff above the original Nyquist frequency — `apply_nyquist_cutoff` now runs as `upscale()`'s final stage.
-- **Fixed in cycle 2:** no measurable added detail below the original Nyquist frequency — root-caused to `threshold_value` being compared as an absolute cutoff against raw int16-scale magnitudes (keeping ~99.8% of samples, a near-identity). `initialize_ist`/`perform_ist_iteration` now threshold relative to each domain's own current peak magnitude instead. **Fixed in cycle 2:** `upscale()`'s wiring to `apply_nyquist_cutoff` is now covered by an end-to-end mocked-I/O test (previously only unit-tested in isolation).
+- **Fixed in cycle 2, regressed, then fixed properly in cycle 3:** no measurable added detail below the original Nyquist frequency. Cycle 2's fix (peak-relative thresholding) traded the original bug for a new one — thresholding one whole-file FFT against its own global peak meant almost nothing outside the single loudest moment ever cleared the cutoff, and an asymmetric transient could make the DC bin that loudest moment, injecting a DC offset + drone (cycle-3-discovered regression). Cycle 3 fixed both: `perform_ist_iteration` now always excludes the DC bin, and `iterative_soft_thresholding` processes long signals in 50%-overlap Hann-windowed blocks so thresholding reflects local dynamics. **Fixed in cycle 2:** `upscale()`'s wiring to `apply_nyquist_cutoff` is now covered by an end-to-end mocked-I/O test (previously only unit-tested in isolation).
+- **Note for a human/future cycle:** `.claude/agents/rules/scientific-coding.md`'s Priority 1 expects an algorithm-level DSP change like cycle 3's block/windowed IST to be reflected in README.md's Algorithm Explanation, but README.md is outside every skill/agent's write scope in this pipeline (`generate-code` is restricted to `fat_llama_fftw/**`; `iterate-fat-llama` itself is restricted to `CHANGELOG.md`/`setup.py`'s version field) — flagged by `generate-code` in cycles 2 and 3, still unresolved. README's Algorithm Explanation should be updated to mention DC-bin exclusion and block/windowed IST processing for long signals.
 - **Still open, out of `generate-code`'s write scope:** `analysis.py` (repo root, outside `fat_llama_fftw/**`) still imports `cupy` (GPU-only) despite this package being the CPU/FFTW-only variant.
 - **Still open, out of scope for any skill/agent to edit directly:** `upscale()`'s actual signature has no `toggle_normalize`/`toggle_autoscale`/`toggle_adaptive_filter` flags and `feed.py` has no `lms_filter` function — `.claude/agents/rules/audio-quality.md`'s pinned baseline config and runtime-estimate section reference these anyway (apparently carried over from the CUDA sibling package's more elaborate `feed.py`). Needs a human or a future permitted `.claude/` edit to reconcile.
 - **Still open, methodology/human decision, not a source bug:** the repo-root reference asset `input_test.flac` is itself a stale output of this same pipeline from *before* the cycle-1 Nyquist-cutoff fix, so it still carries above-Nyquist imaging — `audio-quality-checker`'s spectral-deviation score partly measures agreement with this defective reference rather than fidelity to an independent lossless master. Regenerating it needs a human/methodology decision (e.g. sourcing a true lossless master), not a `generate-code` edit.

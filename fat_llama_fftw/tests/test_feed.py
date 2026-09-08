@@ -348,6 +348,13 @@ class TestFeed(unittest.TestCase):
         ist_changes = iterative_soft_thresholding(sig, max_iter=50,
                                                    threshold=0.6)
         self.assertTrue(np.all(np.isfinite(ist_changes)))
+        # The blocked/overlap-add path pads by a half-block on the left and
+        # a full block on the right before framing, then slices back out -
+        # an off-by-a-hop error there would silently time-shift or truncate
+        # ist_changes relative to the channel upscale_channels adds it to.
+        # upscale_channels does `expanded + ist_changes` with no length
+        # reconciliation, so this must be exact, not approximate.
+        self.assertEqual(len(ist_changes), n)
 
         spectrum = np.abs(np.fft.rfft(ist_changes.astype(np.float64)))
         freq_axis = np.fft.rfftfreq(n, d=1.0 / 44100.0)
@@ -366,6 +373,50 @@ class TestFeed(unittest.TestCase):
         for f, mag in zip(freqs, magnitudes):
             self.assertGreater(mag, 0.01 * peak,
                               f"{f} Hz band shows no measurable added detail")
+
+    def test_iterative_soft_thresholding_no_block_boundary_discontinuity(self):
+        # Regression test for a cycle-4 finding: the blocked/overlap-add
+        # path (cycle 3) windowed only the *analysis* side (frame =
+        # padded[...] * window) then overlap-added frame_result
+        # un-windowed. COLA (adjacent windows summing to a flat constant)
+        # is only a valid reconstruction argument for a *linear* per-block
+        # operation - windowing the input and trusting the operation to
+        # preserve that taper on the way out. _ist_chain is a nonlinear
+        # hard-threshold projection in the FFT domain: verified directly
+        # (a single stationary tone framed through one block), an
+        # analysis-windowed frame's edges taper to ~1e-4 of its own peak,
+        # but perform_ist_iteration's output has edges back up at ~8-11%
+        # of that frame's own peak - thresholding+ifft does not preserve
+        # the input's time-domain taper. Summing that un-tapered edge
+        # content in at full weight at every hop boundary produced a
+        # sample-scale discontinuity ("click") audible as a broadband
+        # impulse train locked to the block hop rate (measured by
+        # audio-quality-checker as a +15.4 dB rise in the 16-22.05kHz band
+        # of a quiet passage, ~76 Hz burst rate matching the hop exactly).
+        #
+        # A stationary, single-tone signal spanning multiple blocks has no
+        # legitimate reason to contain a sample-scale discontinuity
+        # anywhere in the IST output. The discrete second difference
+        # (local curvature) is a sensitive, deterministic detector for
+        # exactly that: on this fixture, the pre-fix code produces one
+        # block-boundary sample whose |d2| is ~67x the signal's own
+        # typical (median) curvature - a genuine click, not sampling
+        # noise - while a WOLA-correct reconstruction stays within a
+        # small multiple of its own typical local curvature throughout.
+        block_size = 8192
+        sample_rate = 44100
+        n = block_size * 8
+        t = np.arange(n) / sample_rate
+        data = (2000 * np.sin(2 * np.pi * 500.0 * t)).astype(np.float64)
+
+        ist_changes = iterative_soft_thresholding(
+            data, max_iter=50, threshold=0.6, block_size=block_size
+        ).astype(np.float64)
+
+        d2 = np.diff(ist_changes, n=2)
+        median_d2 = np.median(np.abs(d2))
+        max_d2 = np.max(np.abs(d2))
+        self.assertLess(max_d2, 10 * median_d2)
 
     def test_apply_nyquist_cutoff_removes_image_content(self):
         original_sample_rate = 8000
@@ -448,6 +499,24 @@ class TestFeed(unittest.TestCase):
         written_data = write_args[2]
         self.assertEqual(written_data.shape[1], 2)
         self.assertTrue(np.all(np.isfinite(written_data)))
+
+        # Asserting only that apply_nyquist_cutoff was *called* checks the
+        # wiring, not the outcome - a later stage reordering (e.g. moving
+        # normalization back after the cutoff) would keep the call and its
+        # arguments identical while still shipping above-Nyquist content.
+        # project-mission.md's hard constraint is about what lands in the
+        # file, so assert that on the data actually handed to write_audio.
+        new_sample_rate = write_args[1]
+        self.assertEqual(new_sample_rate, sample_rate * 4)
+        for ch in range(written_data.shape[1]):
+            spectrum = np.abs(np.fft.rfft(written_data[:, ch]))
+            freqs = np.fft.rfftfreq(written_data.shape[0],
+                                    d=1.0 / new_sample_rate)
+            above = freqs > original_nyquist
+            energy_above = float(np.sum(spectrum[above] ** 2))
+            energy_below = float(np.sum(spectrum[~above] ** 2))
+            self.assertGreater(energy_below, 0)
+            self.assertLess(energy_above, energy_below * 1e-6)
 
     def test_normalize_signal(self):
         signal = np.array([1, 2, 3, 4], dtype=np.float32)
