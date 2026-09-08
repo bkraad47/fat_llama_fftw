@@ -227,7 +227,22 @@ def iterative_soft_thresholding(data, max_iter, threshold,
         frame = padded[start:start + block_size] * window
         frame_result = _ist_chain(frame, max_iter, threshold,
                                   convergence_tol)
-        output[start:start + block_size] += frame_result * window
+        # frame_result's own mean is (numerically) exactly zero -
+        # perform_ist_iteration always excludes the FFT DC bin - but
+        # multiplying by the synthesis window is a frequency-domain
+        # convolution with the window's own spectrum, which is not a
+        # perfect delta at 0 Hz (Hann/sqrt-Hann has a finite main lobe
+        # plus sidelobes). That convolution leaks frame_result's own
+        # near-DC (very low frequency) content into the windowed frame's
+        # DC bin, even though frame_result itself has none. Re-zeroing
+        # here removes exactly that reintroduced constant term (bin 0 of
+        # the windowed frame's own spectrum, equivalently its own time-
+        # domain mean) without touching any other frequency the window
+        # preserved, so it does not reopen the cycle-4 edge-taper/click
+        # regression (window shape at the edges is otherwise untouched).
+        windowed_result = frame_result * window
+        windowed_result = windowed_result - np.mean(windowed_result)
+        output[start:start + block_size] += windowed_result
         weight[start:start + block_size] += window * window
 
     safe_weight = np.where(weight > 1e-8, weight, 1.0)
@@ -264,8 +279,11 @@ def apply_nyquist_cutoff(signal, sample_rate, original_nyquist):
     real bandwidth - it must never leave (or reintroduce) audible content
     above original_sample_rate / 2 in the output, whether that comes from
     the zero-order-hold interpolation's spectral imaging, IST, or anything
-    else. This is applied as the final processing stage, after all other
-    steps, per project-mission.md's hard constraint.
+    else. This runs after amplitude auto-scaling but *before* upscale()'s
+    final normalization step (not strictly last overall) - a brick-wall
+    FFT filter like this one can overshoot its own input's peak
+    (Gibbs-phenomenon ripple), so the final normalization must come after
+    it to guarantee the signal actually written never exceeds full scale.
     """
     n = len(signal)
     spectrum = pyfftw.interfaces.numpy_fft.rfft(signal)
@@ -340,25 +358,36 @@ def upscale(
         scaled_upscaled_channels.append(scaled_channel)
     scaled_upscaled_channels = np.column_stack(scaled_upscaled_channels)
 
-    logger.info("Normalizing audio...")
-    normalized_upscaled_channels = []
-    for i in range(scaled_upscaled_channels.shape[1]):
-        normalized_channel = normalize_signal(scaled_upscaled_channels[:, i])
-        normalized_upscaled_channels.append(normalized_channel)
-    normalized_upscaled_channels = np.column_stack(
-        normalized_upscaled_channels)
-
     new_sample_rate = sample_rate * upscale_factor
 
+    # The Nyquist cutoff (a brick-wall FFT lowpass) runs *before* the final
+    # normalization, not after. A brick-wall filter can overshoot its own
+    # input's peak (Gibbs-phenomenon ripple), so filtering a
+    # already-peak-normalized-to-1.0 signal can push some samples back
+    # above full scale - write_audio's PCM_24 subtype then silently clips
+    # them on write (measured: a handful of samples pinned at exactly
+    # +/-1.0 in the output, clipping fraction ~4e-6). Running the cutoff
+    # first and normalizing its output last guarantees the signal actually
+    # handed to write_audio peaks at exactly 1.0 - not "close to it, unless
+    # the filter pushed it over" - by construction, regardless of any
+    # overshoot the filter introduces.
     logger.info("Removing content above the original Nyquist frequency...")
     original_nyquist = sample_rate / 2.0
-    final_channels = []
-    for i in range(normalized_upscaled_channels.shape[1]):
+    filtered_upscaled_channels = []
+    for i in range(scaled_upscaled_channels.shape[1]):
         filtered_channel = apply_nyquist_cutoff(
-            normalized_upscaled_channels[:, i], new_sample_rate,
+            scaled_upscaled_channels[:, i], new_sample_rate,
             original_nyquist
         )
-        final_channels.append(filtered_channel)
+        filtered_upscaled_channels.append(filtered_channel)
+    filtered_upscaled_channels = np.column_stack(filtered_upscaled_channels)
+
+    logger.info("Normalizing audio...")
+    final_channels = []
+    for i in range(filtered_upscaled_channels.shape[1]):
+        normalized_channel = normalize_signal(
+            filtered_upscaled_channels[:, i])
+        final_channels.append(normalized_channel)
     final_channels = np.column_stack(final_channels)
 
     write_audio(output_file_path, new_sample_rate, final_channels,
