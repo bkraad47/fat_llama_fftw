@@ -20,6 +20,38 @@ logger = logging.getLogger(__name__)
 # re-planning from scratch on every call.
 pyfftw.interfaces.cache.enable()
 
+# README documents "Multi-Threaded processing on cpu" as a feature, but
+# prior to this cycle no call site actually passed FFTW a threads= value
+# above its own default (which pyfftw's numpy_fft interfaces resolve to a
+# single thread) - every FFT/IFFT in this module ran single-threaded
+# regardless of the host's core count. Multi-threading FFTW is only a net
+# win once a transform is large enough to amortize its own thread-dispatch
+# overhead: measured directly, requesting more threads on a small
+# (block_size-scale, 8192-sample) transform is 1.6x-9x SLOWER than a single
+# thread (thread spawn/join overhead dwarfs the actual FFT work at that
+# size), while on a large (~4.7M-sample, real upscaled-file-scale) rfft/
+# irfft it is ~6x FASTER with the identical (bit-for-bit, verified
+# directly) numeric result - multi-threading a real FFTW plan does not
+# change what it computes, only how the work is parallelized. Measured
+# crossover sits between 100k and 300k samples; _fft_thread_count uses
+# 200k as a conservative threshold so this only ever engages for
+# apply_nyquist_cutoff's whole-signal transforms on realistically-sized
+# (post-upscale) audio, never for perform_ist_iteration's fixed-size
+# per-block transforms in the IST loop, which stay single-threaded.
+_MULTI_THREAD_FFT_MIN_SAMPLES = 200_000
+
+
+def _fft_thread_count(n):
+    """How many FFTW threads to request for a transform of length n.
+
+    Single-threaded below _MULTI_THREAD_FFT_MIN_SAMPLES (multi-threading
+    would be a net loss there - see the module-level comment above),
+    otherwise all available CPU cores.
+    """
+    if n < _MULTI_THREAD_FFT_MIN_SAMPLES:
+        return 1
+    return os.cpu_count() or 1
+
 
 def read_audio(file_path, format):
     if not os.path.exists(file_path):
@@ -270,7 +302,7 @@ def iterative_soft_thresholding(data, max_iter, threshold,
 
 
 def _cap_ist_changes_to_baseline_peak(expanded_channel, ist_changes,
-                                      max_rounds=5):
+                                      max_rounds=20):
     # perform_ist_iteration's peak-relative FFT threshold keeps/boosts
     # whichever frequency dominates a block's own spectrum - for real
     # music that is usually low-frequency content, since natural audio
@@ -289,8 +321,9 @@ def _cap_ist_changes_to_baseline_peak(expanded_channel, ist_changes,
     # is not "corrected" downstream, it is what determines how hard every
     # OTHER frequency IST never touched gets divided down when the whole
     # channel is renormalized to full scale. That is the confirmed root
-    # cause of a ~1.2-5dB net attenuation above ~1kHz relative to a
-    # no-IST/plain-interpolation control, measured on real programme
+    # cause of a net attenuation (up to ~1.3dB, worst at ~2kHz-22kHz,
+    # tapering to near 0dB in the low bands IST itself boosts) relative to
+    # a no-IST/plain-interpolation control, measured on real programme
     # material (input_test.mp3): IST was adding real detail in raw terms,
     # but the peak growth that addition caused got "spent" out of every
     # frequency, not just the ones IST boosted.
@@ -308,15 +341,48 @@ def _cap_ist_changes_to_baseline_peak(expanded_channel, ist_changes,
     # A single such correction is only approximate (rescaling can shift
     # which sample is the new peak), and repeated rounds converge closer
     # to fully matching the baseline peak - but full convergence was
-    # measured (directly, via a bisection search for the exact scale)
-    # to squeeze ist_changes down toward zero, i.e. it trades the net-
+    # measured (directly, via a bisection search for the exact scale) to
+    # squeeze ist_changes down toward zero, i.e. it trades the net-
     # attenuation finding for reintroducing the "no measurable added
-    # detail" bug fixed in prior cycles. max_rounds is therefore
-    # deliberately small - a bounded, partial correction (measured on
-    # input_test.mp3: ~65-75% reduction of the net attenuation across the
-    # 20Hz-20kHz range while ist_changes keeps a meaningful fraction, not
-    # a sliver, of its own uncapped peak amplitude), not a convergence
-    # loop like _ist_chain's own early-exit.
+    # detail" bug fixed in prior cycles, so max_rounds must stay bounded,
+    # not a convergence loop like _ist_chain's own early-exit.
+    #
+    # This cycle re-measured that bound/reduction tradeoff directly (on
+    # both a synthetic loud-low-tone/quiet-high-tone fixture and a real
+    # input_test.mp3 slice) at several round counts and found the
+    # previous max_rounds=5 was not actually near the tradeoff's practical
+    # limit: it left combined_peak ~12.5-15% above baseline_peak and the
+    # worst-band attenuation around -1.0 to -1.24dB, while ist_changes
+    # still retained 23-37% of its own uncapped peak magnitude - i.e.
+    # there was real, unused headroom between "5 rounds" and "enough
+    # rounds to reopen the no-added-detail bug" (empirically that only
+    # starts to bite under ~1% surviving fraction, per the same bisection
+    # investigation). max_rounds=20 was chosen from that same measurement:
+    # it roughly triples the attenuation improvement (worst band ~-0.36 to
+    # -0.40dB instead of ~-1.0 to -1.24dB, combined_peak within ~4.4-4.6%
+    # of baseline instead of ~12.5-15%) while ist_changes still keeps
+    # 7-13% of its own uncapped peak magnitude - comfortably above the
+    # near-zero range where the earlier investigation found the
+    # no-added-detail bug reopens. Two genuinely different (not just
+    # "more rounds of the same scalar") corrections were also tried this
+    # cycle and rejected on direct measurement: (a) a sample-wise time-
+    # domain peak limiter (clip ist_changes only at samples where combined
+    # exceeds baseline_peak, leaving every other sample untouched) - on
+    # the synthetic fixture this touched >50% of samples (IST's boost is a
+    # broadly, coherently boosted quasi-periodic component, not a sparse
+    # handful of outliers) and made the high-band attenuation *worse*
+    # (-6.7dB vs -1.24dB uncapped-scalar), i.e. hard-clipping a large
+    # contiguous fraction of a waveform's crest is more distorting than a
+    # uniform scalar shrink of that same region; (b) a frequency-domain
+    # correction that boosted only the FFT bins ist_changes left untouched
+    # by the scalar amount needed to offset the eventual normalize - this
+    # is unstable: boosting "untouched" bins raises the time-domain peak
+    # further, which increases the very shortfall it was trying to correct
+    # (measured: peak inflation grew from 4.3dB to 6.25dB and the high
+    # band attenuation worsened to -1.96dB). Both confirm the directive's
+    # own assessment that a scalar-rescale-based fix is close to its
+    # practical limit for this mechanism - max_rounds=20 is the verified
+    # improvement available within that limit, not a full fix.
     baseline_peak = np.max(np.abs(expanded_channel))
     if baseline_peak == 0:
         return ist_changes
@@ -367,10 +433,12 @@ def apply_nyquist_cutoff(signal, sample_rate, original_nyquist):
     it to guarantee the signal actually written never exceeds full scale.
     """
     n = len(signal)
-    spectrum = pyfftw.interfaces.numpy_fft.rfft(signal)
+    threads = _fft_thread_count(n)
+    spectrum = pyfftw.interfaces.numpy_fft.rfft(signal, threads=threads)
     freqs = np.fft.rfftfreq(n, d=1.0 / sample_rate)
     spectrum = np.where(freqs > original_nyquist, 0, spectrum)
-    filtered = pyfftw.interfaces.numpy_fft.irfft(spectrum, n=n)
+    filtered = pyfftw.interfaces.numpy_fft.irfft(spectrum, n=n,
+                                                 threads=threads)
     return filtered.astype(np.float32)
 
 

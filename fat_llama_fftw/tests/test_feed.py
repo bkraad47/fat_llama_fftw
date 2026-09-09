@@ -11,6 +11,8 @@ from fat_llama_fftw.audio_fattener.feed import (
     iterative_soft_thresholding,
     upscale_channels,
     _cap_ist_changes_to_baseline_peak,
+    _fft_thread_count,
+    _MULTI_THREAD_FFT_MIN_SAMPLES,
     normalize_signal,
     apply_nyquist_cutoff,
     upscale
@@ -237,16 +239,24 @@ class TestFeed(unittest.TestCase):
         # (_cap_ist_changes_to_baseline_peak) so the combined
         # (interpolation + IST) signal's own peak never exceeds the
         # pre-IST interpolated baseline's peak - see that function's own
-        # docstring comment for why (a ~1.2-5dB net attenuation above
-        # ~1kHz relative to a no-IST control, root-caused to this
-        # otherwise-uncapped peak inflation getting divided back out of
-        # every frequency at upscale()'s mandatory final normalize). For
-        # this fixture the uncapped fixed point [-1.5,-1.5,1.5,1.5] added
-        # onto [1,1,3,3] would peak at 4.5, above the baseline's own peak
-        # of 3 - the cap converges (5 rounds) to ist_changes scaled by
-        # 4/7, landing the combined result's peak at 24/7 (~3.42857),
-        # i.e. 8/7 of the source channel's own peak rather than the
-        # uncapped 1.5x.
+        # docstring comment for why (a net attenuation, up to ~1.3dB,
+        # relative to a no-IST control, root-caused to this otherwise-
+        # uncapped peak inflation getting divided back out of every
+        # frequency at upscale()'s mandatory final normalize). For this
+        # fixture the uncapped fixed point [-1.5,-1.5,1.5,1.5] added onto
+        # [1,1,3,3] would peak at 4.5, above the baseline's own peak of 3.
+        # A later cycle raised the cap's default max_rounds from 5 to 20
+        # (see that function's own docstring comment for the measured
+        # tradeoff this was picked from) - for this fixture that loop
+        # never actually satisfies the "combined_peak <= baseline_peak"
+        # break condition (each round's correction is itself only
+        # partial, so the residual keeps shrinking harmonically without
+        # ever crossing zero in finitely many rounds), so it always runs
+        # the full max_rounds. At 20 rounds this converges to ist_changes
+        # scaled by 1/11, landing the combined result's peak at 69/22
+        # (~3.13636), i.e. 23/22 (~1.0455x) of the source channel's own
+        # peak - much closer to the uncapped-vs-baseline case than the
+        # old 5-round default's 8/7 (~1.143x).
         channels = np.array([[1, 2], [3, 4]], dtype=np.float32)
         upscale_factor = 2
         threshold = 0.6
@@ -256,8 +266,8 @@ class TestFeed(unittest.TestCase):
         self.assertEqual(output.shape, (4, 2))
         # Output must be usable audio, not NaN/Inf.
         self.assertTrue(np.all(np.isfinite(output)))
-        expected = np.array([[4 / 7, 10 / 7], [4 / 7, 10 / 7],
-                            [24 / 7, 32 / 7], [24 / 7, 32 / 7]],
+        expected = np.array([[19 / 22, 40 / 22], [19 / 22, 40 / 22],
+                            [69 / 22, 92 / 22], [69 / 22, 92 / 22]],
                             dtype=np.float32)
         np.testing.assert_allclose(output, expected, atol=1e-5)
         # IST must have contributed something here - otherwise this test
@@ -280,7 +290,7 @@ class TestFeed(unittest.TestCase):
         # thresholding it corrects).
         for i, src in enumerate(channels.T):
             self.assertAlmostEqual(float(np.max(np.abs(output[:, i]))),
-                                   (8 / 7) * float(np.max(np.abs(src))),
+                                   (23 / 22) * float(np.max(np.abs(src))),
                                    places=4)
 
     def test_upscale_channels_thresholded_out_is_pure_interpolation(self):
@@ -327,21 +337,30 @@ class TestFeed(unittest.TestCase):
         capped = _cap_ist_changes_to_baseline_peak(expanded, ist_changes)
         combined = expanded + capped
         combined_peak = float(np.max(np.abs(combined)))
-        # Measured directly: this fixture's 5-round cap lands the combined
-        # peak at ~11.76 - a large reduction from the uncapped 25, and
-        # much closer to the baseline of 10, though not exactly at it (an
-        # exact match was verified separately, via a bisection search, to
-        # squeeze ist_changes toward zero instead - the opposite of what
-        # this fix is for).
-        self.assertLess(combined_peak, baseline_peak * 1.3)
+        # Measured directly: this fixture's cap (max_rounds=20, raised
+        # this cycle from 5 - see the function's own docstring comment for
+        # the measured tradeoff behind that change) lands the combined
+        # peak at ~10.48 - a large reduction from the uncapped 25, and
+        # much closer to the baseline of 10 than the old 5-round default's
+        # ~11.76 was, though still not exactly at it (an exact match was
+        # verified separately, via a bisection search, to squeeze
+        # ist_changes toward zero instead - the opposite of what this fix
+        # is for).
+        self.assertLess(combined_peak, baseline_peak * 1.1)
         self.assertLess(combined_peak, uncapped_peak)
         # And it must not have been zeroed outright - a bounded, partial
         # correction (per the function's own max_rounds design) still
-        # keeps a meaningful, non-trivial fraction of the original
-        # contribution, not just whatever sliver survives full
-        # convergence toward zero.
+        # keeps a non-trivial fraction of the original contribution, not
+        # just whatever sliver survives full convergence toward zero. This
+        # particular fixture (a flat, constant-sign ist_changes/expanded
+        # pair) converges faster toward baseline than the more
+        # realistic/oscillating fixtures documented in the function's own
+        # docstring - measured directly, 20 rounds here retains ~3.2% of
+        # ist_changes' own uncapped peak, comfortably above the near-zero
+        # (<1%) range the docstring's bisection investigation found the
+        # no-added-detail bug reopens in.
         self.assertGreater(float(np.max(np.abs(capped))),
-                           0.1 * float(np.max(np.abs(ist_changes))))
+                           0.01 * float(np.max(np.abs(ist_changes))))
 
     def test_cap_ist_changes_to_baseline_peak_zero_baseline(self):
         # Guards the baseline_peak == 0 short-circuit - dividing by a zero
@@ -368,8 +387,11 @@ class TestFeed(unittest.TestCase):
         # quieter high tone (below it, so IST contributes ~0 there in raw
         # terms) - measured pre-fix on this exact fixture: the high tone
         # landed ~4.3dB below the no-IST control after the same
-        # autoscale+cutoff+normalize tail upscale() applies; post-fix
-        # (5-round peak cap) that shrinks to ~1.2dB.
+        # autoscale+cutoff+normalize tail upscale() applies; the original
+        # fix (5-round peak cap) shrank that to ~1.2dB, and this cycle's
+        # max_rounds=5->20 increase (see _cap_ist_changes_to_baseline_
+        # peak's own docstring comment for the measured tradeoff this was
+        # chosen from) shrinks it further to ~0.4dB.
         sample_rate = 44100
         duration = 0.25
         n = int(sample_rate * duration)
@@ -412,10 +434,15 @@ class TestFeed(unittest.TestCase):
 
         hf_ratio_db = 20 * np.log10(
             band_mag(final_ist, hf_freq) / band_mag(final_ctrl, hf_freq))
-        # Pre-fix this measured ~-4.31dB on this exact fixture - the fix
-        # must bring it to a materially smaller attenuation, not merely
-        # not-worse.
-        self.assertGreater(hf_ratio_db, -3.0)
+        # Pre-fix this measured ~-4.31dB on this exact fixture; the
+        # original (5-round) cap brought it to ~-1.2dB, and this cycle's
+        # max_rounds=20 measures ~-0.40dB here - each must be a materially
+        # smaller attenuation than the one before it, not merely
+        # not-worse. -1.0 sits with headroom above the measured -0.40dB
+        # while still well clear of the previous -1.2dB level, so this
+        # bound is a real regression guard for the round-count increase,
+        # not just a restatement of the old bound.
+        self.assertGreater(hf_ratio_db, -1.0)
         # And the low tone (the one IST actually boosts) must not have
         # flipped into a large attenuation either - the cap only bounds
         # peak growth, it should not overcorrect into a net cut there.
@@ -768,34 +795,40 @@ class TestFeed(unittest.TestCase):
         # since adjacent overlapping blocks' means differ, their
         # now-un-tapered edges land at different offsets at every hop
         # boundary - a genuine curvature ("click") bump at the block-hop
-        # rate. Measured directly (this exact fixture/parameters):
-        # reproducing the old flat-scalar subtraction gives a
-        # boundary-phase-folded |second difference| ~19.7dB above the
-        # signal's own typical (median) curvature; the taper-shaped fix
-        # (window * (sum(windowed_result) / sum(window)), which removes
-        # the identical total DC contribution but itself tapers to ~0 at
-        # the block edges) brings that down to ~6.5dB, while leaving
-        # relative DC unchanged (~2.1e-5 either way, far under the
-        # existing 1e-4 regression bound - the fix does not reopen the
-        # cycle-5 DC-leak regression).
+        # rate.
         #
-        # Uses real programme material (input_test.mp3, truncated to ~5s
-        # for speed - ~214 blocks, still many-block and non-stationary)
-        # because - like the cycle-5 DC leak - this is a real-programme-
-        # correlated magnitude effect that a synthetic stationary/white-
-        # noise fixture does not reliably reproduce (see this test's
-        # sibling above).
+        # A later cycle found this test's original fixture/bound (a
+        # truncated ~220k-frame slice, upscale_factor=4, max_iter=50) was
+        # not representative of the settings the pipeline actually runs
+        # at (the baseline config used elsewhere in this project -
+        # upscale_factor=7 for a 1400kbps target against this file's own
+        # 192kbps source, max_iterations=300 - see audio-quality.md's
+        # pinned baseline): measured directly, the truncated fixture gave
+        # ~6.5dB (fixed) vs ~19.7dB (old flat-scalar bug), while the real
+        # baseline settings measure ~16.6dB (fixed) vs ~64.4dB (old bug) -
+        # both numbers scale up substantially at real settings (more
+        # blocks, more IST passes to converge), and the truncated
+        # fixture's old 12.0dB bound sat *below* the fixed code's own
+        # real-settings measurement, so it could not have caught a
+        # regression at the settings that matter. This test now runs the
+        # full file at those real baseline settings directly (this
+        # pipeline is fast enough - see the performance fix elsewhere
+        # this cycle - end to end interpolation+IST on the full stereo
+        # file takes under a second) with a bound picked from this same
+        # real-settings measurement: comfortably above the fixed code's
+        # ~16.6dB (13.4dB of headroom) and well clear of the old bug's
+        # ~64.4dB (34.4dB of clearance), so a regression toward the old
+        # bug's magnitude is still caught long before reaching it.
         if not os.path.exists(_INPUT_TEST_MP3):
             self.skipTest("input_test.mp3 reference asset not present")
 
         sample_rate, samples, bitrate, audio = read_audio(_INPUT_TEST_MP3,
                                                            format='mp3')
-        n_raw = 220000
-        channel = samples[:n_raw, 0].astype(np.float64)
-        expanded = new_interpolation_algorithm(channel, upscale_factor=4)
+        channel = samples[:, 0].astype(np.float64)
+        expanded = new_interpolation_algorithm(channel, upscale_factor=7)
 
         ist_changes = iterative_soft_thresholding(
-            expanded, max_iter=50, threshold=0.6).astype(np.float64)
+            expanded, max_iter=300, threshold=0.6).astype(np.float64)
 
         hop = 4096  # block_size(8192) // 2, the default block_size's hop
         d2 = np.diff(ist_changes, n=2)
@@ -805,15 +838,16 @@ class TestFeed(unittest.TestCase):
         boundary_mean_d2 = np.mean(np.abs(d2[boundary_mask]))
         db_above_median = 20 * np.log10(boundary_mean_d2 / median_d2)
 
-        # Fixed source measures ~6.5dB here; the old flat-scalar
-        # subtraction measures ~19.7dB on this same fixture - 12dB sits
-        # cleanly between the two, well clear of either.
-        self.assertLess(db_above_median, 12.0)
+        # Fixed source measures ~16.6dB here (real baseline settings); the
+        # old flat-scalar subtraction measures ~64.4dB on this same
+        # fixture/settings - 30dB sits with real margin on both sides
+        # (13.4dB above the fixed measurement, 34.4dB below the old bug's).
+        self.assertLess(db_above_median, 30.0)
 
         # And the fix must not have reopened the cycle-5 DC-leak
-        # regression (relative_dc measured ~2.1e-5 with either formula on
-        # this fixture, far under the existing 1e-4 bound elsewhere in
-        # this suite).
+        # regression (relative_dc measured ~3.0e-8 at these real baseline
+        # settings, far under the existing 1e-4 bound elsewhere in this
+        # suite).
         peak = np.max(np.abs(ist_changes))
         self.assertGreater(peak, 0)
         relative_dc = abs(float(np.mean(ist_changes))) / peak
@@ -851,6 +885,77 @@ class TestFeed(unittest.TestCase):
         self.assertLess(energy_above_after, energy_above_before * 1e-4)
         # ...while the in-band tone content survives.
         self.assertGreater(energy_below_after, 0)
+
+    def test_fft_thread_count_scoped_to_large_transforms(self):
+        # Regression test for this cycle's performance finding: README
+        # documents "Multi-Threaded processing on cpu" as a feature, but no
+        # FFT/IFFT call site previously requested more than pyfftw's own
+        # single-thread default - measured directly, that leaves a ~6x
+        # speedup on the table for apply_nyquist_cutoff's whole-signal
+        # transforms on realistically-sized (post-upscale) audio (~4.7M
+        # samples), with bit-for-bit identical numeric output (also
+        # measured directly - multi-threading FFTW changes how the work is
+        # split, not what it computes). But requesting multiple threads is
+        # a *regression* at the small, fixed block_size (8192) scale
+        # perform_ist_iteration's per-block transforms run at - measured
+        # 1.6x-9x SLOWER there, since thread spawn/join overhead dwarfs the
+        # actual FFT work at that size. So the thread count must be
+        # length-adaptive, not a blanket increase everywhere pyfftw is
+        # called.
+        self.assertEqual(_fft_thread_count(8192), 1)
+        self.assertEqual(_fft_thread_count(_MULTI_THREAD_FFT_MIN_SAMPLES - 1),
+                         1)
+        multi = _fft_thread_count(_MULTI_THREAD_FFT_MIN_SAMPLES)
+        self.assertGreaterEqual(multi, 1)
+        multi_large = _fft_thread_count(5_000_000)
+        self.assertEqual(multi_large, multi)
+        # On a machine with more than one core, the large-transform path
+        # must actually request more than one thread - a length-adaptive
+        # function that always returns 1 would pass every other assertion
+        # here while delivering none of the measured speedup.
+        if os.cpu_count() and os.cpu_count() > 1:
+            self.assertGreater(multi_large, 1)
+
+    def test_apply_nyquist_cutoff_requests_multiple_threads_for_large_signal(
+            self):
+        # Direct regression test for the performance fix's wiring: a
+        # signal at/above _MULTI_THREAD_FFT_MIN_SAMPLES must have its
+        # rfft/irfft calls made with threads > 1 (when the host has more
+        # than one core), while a small signal (e.g. the default
+        # block_size, matching perform_ist_iteration's per-block calls)
+        # must not - spies on the real pyfftw calls (wraps=) so this
+        # verifies actual wiring, not just the standalone thread-count
+        # helper above, and still runs the genuine FFT/IFFT so output
+        # correctness stays covered by
+        # test_apply_nyquist_cutoff_removes_image_content.
+        if not (os.cpu_count() and os.cpu_count() > 1):
+            self.skipTest("single-core host - no multi-thread path to "
+                          "distinguish from the single-thread default")
+
+        sample_rate = 8000
+        n_large = _MULTI_THREAD_FFT_MIN_SAMPLES
+        original_nyquist = sample_rate / 2.0
+        large_signal = np.zeros(n_large, dtype=np.float32)
+
+        with patch.object(feed_module.pyfftw.interfaces.numpy_fft, 'rfft',
+                          wraps=feed_module.pyfftw.interfaces.numpy_fft.rfft
+                          ) as rfft_spy, \
+             patch.object(feed_module.pyfftw.interfaces.numpy_fft, 'irfft',
+                          wraps=feed_module.pyfftw.interfaces.numpy_fft.irfft
+                          ) as irfft_spy:
+            apply_nyquist_cutoff(large_signal, sample_rate, original_nyquist)
+
+        rfft_spy.assert_called_once()
+        irfft_spy.assert_called_once()
+        self.assertGreater(rfft_spy.call_args.kwargs['threads'], 1)
+        self.assertGreater(irfft_spy.call_args.kwargs['threads'], 1)
+
+        small_signal = np.zeros(8192, dtype=np.float32)
+        with patch.object(feed_module.pyfftw.interfaces.numpy_fft, 'rfft',
+                          wraps=feed_module.pyfftw.interfaces.numpy_fft.rfft
+                          ) as rfft_spy_small:
+            apply_nyquist_cutoff(small_signal, sample_rate, original_nyquist)
+        self.assertEqual(rfft_spy_small.call_args.kwargs['threads'], 1)
 
     @patch.object(feed_module, 'write_audio')
     @patch.object(feed_module, 'read_audio')
@@ -979,6 +1084,44 @@ class TestFeed(unittest.TestCase):
         # numeric step is what makes this exact.
         self.assertAlmostEqual(float(np.max(np.abs(written_data))), 1.0,
                                places=6)
+
+        # Test-coherence gap found by audio-quality-checker this cycle:
+        # project-mission.md's hard constraint (no content above the
+        # original source's Nyquist frequency in the written output) is
+        # asserted end to end in exactly one other place -
+        # test_upscale_wires_apply_nyquist_cutoff - whose fixture is 20
+        # frames of uniform random int16 at 8000 Hz. That signal is 80
+        # output samples long, so its rFFT has ~40 bins total and it never
+        # reaches iterative_soft_thresholding's blocked/WOLA path at all
+        # (n << the 8192 default block_size). In other words, the one
+        # constraint this project treats as non-negotiable was only ever
+        # verified end to end on a degenerate fixture that cannot exercise
+        # the two stages most likely to reintroduce above-Nyquist content
+        # (the overlap-add reconstruction and the brick-wall filter's
+        # behaviour on real broadband programme material).
+        #
+        # This test already runs real programme material all the way
+        # through upscale() and holds the written data, so the check costs
+        # one rFFT per channel and no extra pipeline time. Measured
+        # directly on this fixture/parameters: the above-Nyquist energy
+        # ratio lands ~7e-14 (about -131 dB), i.e. pure float32 rounding
+        # residue from the brick-wall zeroing - the 1e-9 bound below sits
+        # several orders of magnitude above that, so it flags a genuine
+        # reintroduction of imaging/harmonics rather than tracking
+        # rounding noise.
+        new_sample_rate = write_args[1]
+        original_nyquist = 44100 / 2.0
+        self.assertEqual(new_sample_rate, 44100 * 7)  # 1411/192 -> factor 7
+        for ch in range(written_data.shape[1]):
+            spectrum = np.abs(np.fft.rfft(
+                written_data[:, ch].astype(np.float64)))
+            freqs = np.fft.rfftfreq(written_data.shape[0],
+                                    d=1.0 / new_sample_rate)
+            above = freqs > original_nyquist
+            energy_above = float(np.sum(spectrum[above] ** 2))
+            energy_below = float(np.sum(spectrum[~above] ** 2))
+            self.assertGreater(energy_below, 0)
+            self.assertLess(energy_above, energy_below * 1e-9)
 
     def test_normalize_signal(self):
         signal = np.array([1, 2, 3, 4], dtype=np.float32)
