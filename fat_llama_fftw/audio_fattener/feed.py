@@ -4,7 +4,6 @@ from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import pyfftw
-from pydub import AudioSegment
 import soundfile as sf
 from mutagen.mp3 import MP3
 from mutagen.flac import FLAC
@@ -69,9 +68,7 @@ def read_audio(file_path, format):
     if not os.path.exists(file_path):
         raise FileNotFoundError(f"File {file_path} not found.")
 
-    audio = AudioSegment.from_file(file_path, format=format)
-    samples = np.array(audio.get_array_of_samples())
-    sample_rate = audio.frame_rate
+    samples, sample_rate = sf.read(file_path)
     bitrate = None
 
     if format == 'mp3':
@@ -90,10 +87,10 @@ def read_audio(file_path, format):
         duration_seconds = len(audio) / 1000.0
         bitrate = (len(samples) * 8) / duration_seconds
 
-    if audio.channels == 2:
+    if samples.ndim == 2:
         samples = samples.reshape((-1, 2))
 
-    return sample_rate, samples, bitrate, audio
+    return sample_rate, samples, bitrate
 
 
 def write_audio(file_path, sample_rate, data, format):
@@ -594,17 +591,13 @@ def upscale(
         )
 
     logger.info(f"Loading {source_format.upper()} file...")
-    sample_rate, samples, bitrate, audio = read_audio(input_file_path,
+    sample_rate, samples, bitrate = read_audio(input_file_path,
                                                        format=source_format)
     if bitrate:
         logger.info(
             f"Original {source_format.upper()} bitrate: "
             f"{bitrate / 1000:.2f} kbps"
         )
-
-    samples = np.array(audio.get_array_of_samples())
-    if audio.channels == 2:
-        samples = samples.reshape((-1, 2))
 
     target_bitrate = target_bitrate_kbps * 1000
     upscale_factor = round(target_bitrate / bitrate) if bitrate else 4

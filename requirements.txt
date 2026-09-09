@@ -1,6 +1,5 @@
 numpy
 pyfftw
-pydub
 soundfile
 mutagen
 scipy
