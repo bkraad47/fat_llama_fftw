@@ -21,23 +21,34 @@ logger = logging.getLogger(__name__)
 pyfftw.interfaces.cache.enable()
 
 # README documents "Multi-Threaded processing on cpu" as a feature, but
-# prior to this cycle no call site actually passed FFTW a threads= value
-# above its own default (which pyfftw's numpy_fft interfaces resolve to a
-# single thread) - every FFT/IFFT in this module ran single-threaded
+# prior to an earlier cycle no call site actually passed FFTW a threads=
+# value above its own default (which pyfftw's numpy_fft interfaces resolve
+# to a single thread) - every FFT/IFFT in this module ran single-threaded
 # regardless of the host's core count. Multi-threading FFTW is only a net
 # win once a transform is large enough to amortize its own thread-dispatch
 # overhead: measured directly, requesting more threads on a small
 # (block_size-scale, 8192-sample) transform is 1.6x-9x SLOWER than a single
 # thread (thread spawn/join overhead dwarfs the actual FFT work at that
 # size), while on a large (~4.7M-sample, real upscaled-file-scale) rfft/
-# irfft it is ~6x FASTER with the identical (bit-for-bit, verified
-# directly) numeric result - multi-threading a real FFTW plan does not
-# change what it computes, only how the work is parallelized. Measured
-# crossover sits between 100k and 300k samples; _fft_thread_count uses
-# 200k as a conservative threshold so this only ever engages for
-# apply_nyquist_cutoff's whole-signal transforms on realistically-sized
-# (post-upscale) audio, never for perform_ist_iteration's fixed-size
-# per-block transforms in the IST loop, which stay single-threaded.
+# irfft it is faster on a warm (already-planned) FFTW plan - measured on a
+# 20-core host: 0.77x (i.e. slightly SLOWER) at 200k samples, 1.37x at 1M,
+# 1.60x at 2M, and 4.48x at the real ~4,672,878-sample post-upscale length
+# (not the ~6x this comment previously claimed - that number came from a
+# less careful benchmark). The two paths' output is numerically equivalent,
+# NOT bit-for-bit identical, at every length: verified directly, they match
+# exactly at n=200k/1M/2M but differ at n=300k/500k and at the real
+# 4,672,878-sample length, by up to ~3.8e-7 of the signal's own peak. This
+# is float32 rounding from FFTW's threaded planner choosing a different (but
+# equally valid) decomposition of the same transform at some lengths, not a
+# change in what is computed - see
+# test_apply_nyquist_cutoff_requests_multiple_threads_for_large_signal's
+# tolerance-based (not exact-equality) regression coverage for this.
+# Measured crossover to a reliable win sits below 1M samples but above
+# 200k, with some noise near the boundary; _fft_thread_count uses 200k as
+# a threshold so this engages for apply_nyquist_cutoff's whole-signal
+# transforms on realistically-sized (post-upscale) audio, never for
+# perform_ist_iteration's fixed-size per-block transforms in the IST loop,
+# which stay single-threaded.
 _MULTI_THREAD_FFT_MIN_SAMPLES = 200_000
 
 
