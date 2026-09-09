@@ -70,7 +70,7 @@ write_audio('output_test.flac', 44100, upscaled_samples, 'flac')
 ### `new_interpolation_algorithm(data, upscale_factor) -> np.ndarray`
 **File:** fat_llama_fftw/audio_fattener/feed.py:60
 **Kind:** function
-**Description:** Zero-order-hold upsampling: repeats each input sample `upscale_factor` times, ahead of IST refinement. This is the interpolation step named in README's Algorithm Explanation step 3. Being zero-order-hold, it images the original spectrum above the original Nyquist frequency — that's why `upscale()` runs `apply_nyquist_cutoff` as a later stage. **Vectorized in this run's cycle 1** — replaced a plain Python double loop with `np.repeat` (bit-for-bit identical output, ~54x measured speedup on a 200k-sample/4x-upscale array; pure performance change).
+**Description:** **Rewritten in this run's cycle 5 (final cycle):** now bandlimited (FFT zero-padding / ideal sinc) interpolation — `rfft` the channel, zero-pad its one-sided spectrum to the upscaled length's own `rfft` size, `irfft` back, rescale for the length change — replacing the prior zero-order-hold (repeat-each-sample) implementation. ZOH imaged the original spectrum above the original Nyquist frequency (a sinc-comb effect, measured -34.7dB relative on real material); bandlimited interpolation adds no new spectral content by construction (measured -153dB relative, near the noise floor), freeing genuine headroom for IST's own below-Nyquist detail. Verified end-to-end: the 8-22.05kHz band vs. the reference moved from -0.402dB to +0.531dB (crossing from "no added detail" to measurable added content), while the hard above-Nyquist constraint improved slightly (-131.4dB → -133.6dB). Exact passthrough at original sample positions; identity short-circuit at `upscale_factor==1`.
 **Parameters:**
 - `data` (`np.ndarray`): 1-D channel samples.
 - `upscale_factor` (`int`): how many times to repeat each sample.
@@ -144,9 +144,9 @@ ist_changes = iterative_soft_thresholding(expanded_channel, max_iter=300, thresh
 **Returns:** `np.ndarray` — `ist_changes`, rescaled.
 
 ### `upscale_channels(channels, upscale_factor, max_iter, threshold) -> np.ndarray`
-**File:** fat_llama_fftw/audio_fattener/feed.py:122
+**File:** fat_llama_fftw/audio_fattener/feed.py
 **Kind:** function
-**Description:** Runs interpolation + IST per channel (looping over `channels.T`), adding each channel's IST result back onto its interpolated version, then stacks the processed channels back into a single 2-D array.
+**Description:** Runs interpolation + IST + peak-cap per channel (each channel's own work factored into a new `_process_channel` helper), then stacks the processed channels back into a single 2-D array. **Cycle-5 performance fix:** for multi-channel (stereo) input, dispatches each channel's independent work across a `ThreadPoolExecutor` (numpy/pyfftw release the GIL during vectorized FFT work) instead of a sequential loop — measured 1.24x wall-clock speedup on real stereo `input_test.mp3`, verified bit-identical output. Mono input skips the thread pool (no benefit for one unit of work). A finer-grained attempt (parallelizing per-block work inside `iterative_soft_thresholding` itself) was tried and rejected — measured a net loss at every worker count, since each block's work is too small to amortize dispatch overhead.
 **Parameters:**
 - `channels` (`np.ndarray`): shape `(n_samples, n_channels)`.
 - `upscale_factor` (`int`): passed to `new_interpolation_algorithm`.

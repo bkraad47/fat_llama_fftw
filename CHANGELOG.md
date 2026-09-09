@@ -2,6 +2,31 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.4.1] - 2026-09-09
+
+Second `iterate-fat-llama` run (5 cycles), continuing directly from 1.4.0, focused on closing that release's known gaps: the persistent lack of measurable added detail, and further performance work.
+
+### Fixed
+
+- **The upscale now measurably restores detail in thin/missing frequency bands, not just a safe transparent pass-through.** The interpolation stage was replaced from zero-order-hold (repeat-each-sample, which images the original spectrum above the source's Nyquist frequency as a side effect) to bandlimited FFT-domain interpolation, which adds no new spectral content by construction. This freed real headroom for IST's own contribution: the reference's thinnest frequency bins now gain up to +8 dB, with consistent positive gains from 8 kHz up to the original Nyquist frequency (as much as +5 dB at the top), verified as programme-correlated content rather than a broadband noise-floor rise.
+- **Reduced (then further reduced) a high-shelf attenuation** where IST's own processing was inadvertently pulling down untouched high frequencies during final normalization — down from ~4 dB to sub-audible before the interpolation fix above made it moot.
+- Fixed a residual, low-severity block-boundary artifact left over from the 1.4.0 release's own fix for the same class of issue (a DC-removal step was undoing part of the edge tapering it depended on).
+- Corrected an inaccurate code comment overstating a threading-related performance change's actual speedup and exactness guarantee.
+- Removed a stray `cupy` (GPU) import from `analysis.py`, the standalone spectrogram/comparison script — it now runs on plain CPU/`numpy`, matching the rest of the package.
+
+### Performance
+
+- Vectorized the interpolation step (`np.repeat` instead of a manual Python loop) — ~54x faster on its own.
+- The final Nyquist-frequency safety filter now uses multi-threaded FFTs for large signals — ~4.5x faster at real file sizes.
+- Stereo channels are now processed in parallel (previously sequential) — ~1.2-1.7x faster end to end, verified bit-identical output.
+- Net effect across both this run and 1.4.0: the reference test file's full pipeline run dropped from ~44 seconds to ~2 seconds.
+
+### Known remaining gaps
+
+- `.claude/agents/rules/audio-quality.md`'s internal test-baseline configuration still references parameters that don't exist on `upscale()` (a leftover from this package's CUDA sibling project) — needs a human edit; blocked by local tooling permissions during this run.
+- The committed reference asset `input_test.flac` is itself a legacy output of an earlier (zero-order-hold-era) version of this pipeline, not an independent lossless master — worth considering whether to regenerate it from a true master at some point.
+- The multi-thread FFT crossover threshold could likely be raised further for an additional performance gain (identified but not acted on this run).
+
 ## [1.4.0] - 2026-09-08
 
 Five-cycle `iterate-fat-llama` run focused on upscale pipeline performance and audio coherence (`fat_llama_fftw/audio_fattener/feed.py`).

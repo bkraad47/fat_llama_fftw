@@ -322,11 +322,35 @@ class TestFeed(unittest.TestCase):
         self.assertTrue(np.all(np.isfinite(output)))
         # IST must have contributed something here - otherwise this test
         # would be indistinguishable from pure interpolation.
+        #
+        # Assertion strengthened by audio-quality-checker: this previously
+        # read `assertGreater(max|output - interpolated|, 0.0)`, which any
+        # float-rounding residue satisfies - so it could not distinguish
+        # "IST contributed real detail" from "IST collapsed to ~zero and
+        # only float noise remains". That collapse is exactly the failure
+        # mode this project has regressed into repeatedly (the "no
+        # measurable added detail" finding, and the near-zero end of
+        # _cap_ist_changes_to_baseline_peak's own documented round-count
+        # tradeoff), so the bound must be a real fraction of the signal,
+        # not merely non-zero. Measured directly on this exact fixture:
+        # IST's contribution is 4.5% of each channel's own interpolated
+        # peak, so a 1% floor keeps ~4.5x headroom while still failing
+        # loudly on a collapse.
         interpolated = np.column_stack([
             new_interpolation_algorithm(channels[:, i], upscale_factor)
             for i in range(channels.shape[1])
         ])
         self.assertGreater(float(np.max(np.abs(output - interpolated))), 0.0)
+        for i in range(channels.shape[1]):
+            interp_peak = float(np.max(np.abs(interpolated[:, i])))
+            self.assertGreater(interp_peak, 0.0)
+            contribution = float(np.max(np.abs(output[:, i]
+                                               - interpolated[:, i])))
+            self.assertGreater(
+                contribution, 0.01 * interp_peak,
+                f"channel {i}: IST contributed only "
+                f"{contribution / interp_peak:.2%} of the interpolated "
+                f"peak - effectively a no-op")
         # And the capped result's own peak must not exceed the source
         # channel's own peak by more than a small, bounded margin - the
         # cap's whole purpose is to keep IST from inflating the channel's
