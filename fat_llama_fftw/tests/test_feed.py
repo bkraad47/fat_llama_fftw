@@ -1,6 +1,6 @@
 import os
 import unittest
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 import numpy as np
 from fat_llama_fftw.audio_fattener.feed import (
     read_audio,
@@ -48,10 +48,11 @@ class TestFeed(unittest.TestCase):
         self.assertEqual(samples.shape, (44100 * 4 // 2, 2))
         # The bitrate must be the one reported by the MP3 tag reader, not None.
         self.assertEqual(bitrate, 1411000)
-        # The returned AudioSegment must be the decoded object itself.
-        #self.assertIs(audio, mock_audio)
-        # Stereo de-interleaving must preserve sample content and ordering:
-        # the flat array is [L0, R0, L1, R1, ...].
+        # read_audio returns exactly what soundfile decoded, in soundfile's
+        # own (frames, channels) shape - no de-interleaving/reshape of its
+        # own (that was a pydub-era step, removed this cycle along with the
+        # hardcoded reshape((-1, 2)) that corrupted >2-channel sources).
+        # Sample content and per-channel ordering must survive untouched.
         expected = np.arange(44100 * 4, dtype=np.int16).reshape((-1, 2))
         np.testing.assert_array_equal(samples, expected)
         # Duration implied by the returned samples must match the source.
@@ -1387,13 +1388,18 @@ class TestFeed(unittest.TestCase):
         # tiny synthetic signal without touching the filesystem.
         sample_rate = 8000
         n_frames = 20
-        mock_audio = MagicMock()
-        mock_audio.channels = 2
         rng = np.random.default_rng(7)
-        flat_samples = (rng.integers(-3000, 3000, size=(n_frames, 2))
-                       .astype(np.int16))
-        mock_audio.get_array_of_samples.return_value = flat_samples
-        mock_read_audio.return_value = (sample_rate, flat_samples, None)
+        # Coherence fix (audio-quality-checker): this fixture used to be
+        # raw int16-range integers plus an unused pydub `AudioSegment`
+        # MagicMock - both leftovers from before read_audio was rewritten
+        # onto soundfile. read_audio can no longer return either: it hands
+        # back soundfile.read's own float64 samples, normalized to roughly
+        # [-1, 1]. Mocking a return value the real function cannot produce
+        # is exactly the kind of stale fixture that hides a scale-dependent
+        # regression in the stage under test, so mock what read_audio
+        # actually returns now.
+        samples = rng.uniform(-0.9, 0.9, size=(n_frames, 2))
+        mock_read_audio.return_value = (sample_rate, samples, None)
 
         original_nyquist = sample_rate / 2.0
 
@@ -1453,6 +1459,97 @@ class TestFeed(unittest.TestCase):
             energy_below = float(np.sum(spectrum[~above] ** 2))
             self.assertGreater(energy_below, 0)
             self.assertLess(energy_above, energy_below * 1e-6)
+
+    @patch.object(feed_module, 'write_audio')
+    @patch.object(feed_module, 'read_audio')
+    def test_upscale_clamps_upscale_factor_to_one_for_high_bitrate_source(
+            self, mock_read_audio, mock_write_audio):
+        # Regression test for a confirmed crash (this cycle's one remaining
+        # finding): `upscale_factor = round(target_bitrate / bitrate)` had
+        # no lower bound. A 96kHz/24-bit stereo source (a legitimate,
+        # plausible input - lossless WAV/FLAC sources are supported per
+        # project-mission.md) reports a raw PCM bitrate of
+        # 96000 * 24 * 2 = 4,608,000 bps; against the pinned baseline's
+        # target_bitrate_kbps=1400 (target_bitrate=1,400,000),
+        # round(1400000 / 4608000) == 0, and new_interpolation_algorithm
+        # (which only special-cases upscale_factor==1, not 0) crashed
+        # trying to broadcast its full-length rfft spectrum into a
+        # 1-element array: "could not broadcast input array from shape
+        # (N,) into shape (1,)". Verified directly (this cycle, before the
+        # fix): calling new_interpolation_algorithm(data, upscale_factor=0)
+        # on a 96000-sample array reproduces exactly this error, with
+        # N=48001 (that array's own rfft length).
+        sample_rate = 96000
+        n_frames = 64
+        rng = np.random.default_rng(13)
+        samples = rng.uniform(-0.5, 0.5, size=(n_frames, 2))
+        source_bitrate = sample_rate * 24 * 2  # 24-bit stereo PCM
+        mock_read_audio.return_value = (sample_rate, samples, source_bitrate)
+
+        with self.assertLogs(feed_module.logger, level='WARNING') as cm:
+            upscale(
+                input_file_path='in.wav',
+                output_file_path='out.flac',
+                source_format='wav',
+                target_format='flac',
+                max_iterations=5,
+                threshold_value=0.6,
+                target_bitrate_kbps=1400
+            )
+
+        # A clear, explanatory warning must have been logged - not a
+        # silent clamp and not the cryptic broadcast ValueError.
+        self.assertTrue(
+            any('upscale factor' in msg.lower() or 'upscale_factor'
+                in msg.lower() for msg in cm.output),
+            f"expected an explanatory warning about the clamp, got: "
+            f"{cm.output}")
+
+        mock_write_audio.assert_called_once()
+        write_args, write_kwargs = mock_write_audio.call_args
+        written_data = write_args[2]
+        self.assertTrue(np.all(np.isfinite(written_data)))
+        # upscale_factor must have been clamped to 1 - no sample-rate
+        # increase, but no crash either, and the frame count must match
+        # the (unscaled) source exactly.
+        new_sample_rate = write_args[1]
+        self.assertEqual(new_sample_rate, sample_rate)
+        self.assertEqual(written_data.shape[0], n_frames)
+
+    @patch.object(feed_module, 'write_audio')
+    @patch.object(feed_module, 'read_audio')
+    def test_upscale_factor_one_from_moderately_high_bitrate_source_no_warning(
+            self, mock_read_audio, mock_write_audio):
+        # Companion case named in this cycle's finding: a 44100Hz/24-bit
+        # stereo source (bitrate 44100 * 24 * 2 = 2,116,800 bps) against the
+        # same target_bitrate_kbps=1400 already rounds to exactly 1 -
+        # round(1400000 / 2116800) == 1 - pre-fix, so this path is not the
+        # crash and must not regress into treating a naturally-computed
+        # upscale_factor=1 as if it were a clamp: no warning should fire
+        # here, since raw_upscale_factor was never below 1 to begin with.
+        sample_rate = 44100
+        n_frames = 64
+        rng = np.random.default_rng(17)
+        samples = rng.uniform(-0.5, 0.5, size=(n_frames, 2))
+        source_bitrate = sample_rate * 24 * 2
+        mock_read_audio.return_value = (sample_rate, samples, source_bitrate)
+
+        with patch.object(feed_module.logger, 'warning') as warn_spy:
+            upscale(
+                input_file_path='in.wav',
+                output_file_path='out.flac',
+                source_format='wav',
+                target_format='flac',
+                max_iterations=5,
+                threshold_value=0.6,
+                target_bitrate_kbps=1400
+            )
+        warn_spy.assert_not_called()
+
+        mock_write_audio.assert_called_once()
+        write_args, write_kwargs = mock_write_audio.call_args
+        new_sample_rate = write_args[1]
+        self.assertEqual(new_sample_rate, sample_rate)  # factor 1, unclamped
 
     @patch.object(feed_module, 'write_audio')
     def test_upscale_output_never_exceeds_full_scale(self, mock_write_audio):
@@ -1550,7 +1647,7 @@ class TestFeed(unittest.TestCase):
         # genuinely unmocked write_audio -> soundfile.write call, or reads
         # the result back off disk the way a real caller (e.g. example.py)
         # would. This runs the real, unmocked upscale() against the repo's
-        # own real_test.mp3 reference asset, writes an actual FLAC file to
+        # own input_test.mp3 reference asset, writes an actual FLAC file to
         # a temp directory, and verifies its on-disk properties directly
         # via soundfile/mutagen - the same tools a caller would use, not
         # feed.py's own internals.

@@ -633,7 +633,37 @@ def upscale(
         )
 
     target_bitrate = target_bitrate_kbps * 1000
-    upscale_factor = round(target_bitrate / bitrate) if bitrate else 4
+    # round(target_bitrate / bitrate) has no lower bound: a source whose own
+    # bitrate already exceeds ~2x target_bitrate (e.g. a 96kHz/24-bit stereo
+    # WAV source against the default 1411kbps target, or any lossless
+    # WAV/FLAC source generally - both supported source formats per
+    # project-mission.md) rounds to 0. new_interpolation_algorithm has an
+    # explicit identity short-circuit at upscale_factor==1 but nothing for
+    # upscale_factor==0: at 0 it computes new_len = new_n // 2 + 1 == 1 and
+    # then tries to assign the original (much longer) rfft spectrum into
+    # that single-bin array, raising a cryptic
+    # "could not broadcast input array from shape (N,) into shape (1,)"
+    # ValueError with no indication of the actual cause. A high-resolution
+    # source exceeding the requested target bitrate is a legitimate, common
+    # scenario (not user error), so the fix is not to raise - it is to
+    # clamp upscale_factor to a floor of 1 (i.e. "at least reproduce the
+    # source's own resolution, never shrink it or crash trying to") and log
+    # clearly why no further upsampling will happen this run. The rest of
+    # the pipeline (IST-based precision refinement, the Nyquist-safe
+    # headroom/format conversion) still runs and still adds value even
+    # when upscale_factor==1, consistent with upscale() being a precision/
+    # headroom/format upscale rather than strictly a sample-count increase.
+    raw_upscale_factor = round(target_bitrate / bitrate) if bitrate else 4
+    upscale_factor = max(1, raw_upscale_factor)
+    if raw_upscale_factor < 1:
+        logger.warning(
+            f"Source bitrate ({bitrate / 1000:.2f} kbps) already exceeds "
+            f"the requested target_bitrate_kbps ({target_bitrate_kbps} "
+            "kbps) enough that the computed upscale factor would be "
+            f"{raw_upscale_factor}. Clamping to upscale_factor=1: the "
+            "sample rate will not be increased, but IST-based precision "
+            "refinement and format conversion still run."
+        )
     logger.info(f"Upscale factor set to: {upscale_factor}")
 
     if samples.ndim == 1:
