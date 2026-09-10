@@ -11,6 +11,9 @@ setup(
         'mutagen',
         'scipy',
     ],
+    extras_require={
+        'tests': 'pydub'
+    },
     package_data={
         'fat_llama_fftw': ['audio_fattener/*.py', 'tests/*.py'],
     },
