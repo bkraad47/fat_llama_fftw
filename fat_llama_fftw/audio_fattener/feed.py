@@ -65,7 +65,7 @@ def _fft_thread_count(n):
 
 
 def read_audio(file_path, format):
-    if not os.path.exists(file_path):
+    if isinstance(file_path, str) and not os.path.exists(file_path):
         raise FileNotFoundError(f"File {file_path} not found.")
 
     samples, sample_rate = sf.read(file_path)
