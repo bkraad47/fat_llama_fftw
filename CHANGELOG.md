@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.4.2] - 2026-09-09
+
+### Changed
+- Removes pydub from read_audio and replaces it with soundfile.
+- Removes pydub from dependencies because it's now rendered obsolete
+
 ## [1.4.1] - 2026-09-09
 
 Second `iterate-fat-llama` run (5 cycles), continuing directly from 1.4.0, focused on closing that release's known gaps: the persistent lack of measurable added detail, and further performance work.

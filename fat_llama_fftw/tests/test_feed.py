@@ -33,25 +33,23 @@ _INPUT_TEST_MP3 = os.path.join(_REPO_ROOT, 'input_test.mp3')
 
 class TestFeed(unittest.TestCase):
 
-    @patch('fat_llama_fftw.audio_fattener.feed.AudioSegment.from_file')
+    @patch('fat_llama_fftw.audio_fattener.feed.sf.read')
     @patch('fat_llama_fftw.audio_fattener.feed.MP3')
     @patch('os.path.exists', return_value=True)
-    def test_read_audio(self, mock_exists, mock_mp3, mock_from_file):
-        mock_audio = MagicMock()
-        mock_audio.frame_rate = 44100
-        mock_audio.channels = 2
-        mock_audio.get_array_of_samples.return_value = np.arange(
-            44100 * 4, dtype=np.int16)
-        mock_from_file.return_value = mock_audio
+    def test_read_audio(self, mock_exists, mock_mp3, mock_read):
+        frame_rate = 44100
+        samples = np.arange(
+            44100 * 4, dtype=np.int16).reshape(-1, 2)
+        mock_read.return_value = (samples, frame_rate)
         mock_mp3.return_value.info.bitrate = 1411000
 
-        sample_rate, samples, bitrate, audio = read_audio('test.mp3', 'mp3')
+        sample_rate, samples, bitrate = read_audio(_INPUT_TEST_MP3, 'mp3')
         self.assertEqual(sample_rate, 44100)
         self.assertEqual(samples.shape, (44100 * 4 // 2, 2))
         # The bitrate must be the one reported by the MP3 tag reader, not None.
         self.assertEqual(bitrate, 1411000)
         # The returned AudioSegment must be the decoded object itself.
-        self.assertIs(audio, mock_audio)
+        #self.assertIs(audio, mock_audio)
         # Stereo de-interleaving must preserve sample content and ordering:
         # the flat array is [L0, R0, L1, R1, ...].
         expected = np.arange(44100 * 4, dtype=np.int16).reshape((-1, 2))
@@ -154,10 +152,10 @@ class TestFeed(unittest.TestCase):
                 float(np.corrcoef(written[:, 0], data[:, 1])[0, 1]), 0.5)
 
             # ...and feed's own reader must agree with soundfile about it.
-            read_sr, read_samples, read_bitrate, read_audio_seg = read_audio(
+            read_sr, read_samples, read_bitrate = read_audio(
                 path, 'flac')
             self.assertEqual(read_sr, sample_rate)
-            self.assertEqual(read_audio_seg.channels, 2)
+            self.assertEqual(read_samples.ndim, 2)
             self.assertEqual(read_samples.shape, (frames, 2))
             self.assertGreater(read_bitrate, 0)
             self.assertAlmostEqual(read_samples.shape[0] / read_sr,
@@ -614,7 +612,7 @@ class TestFeed(unittest.TestCase):
         if not os.path.exists(_INPUT_TEST_MP3):
             self.skipTest("input_test.mp3 reference asset not present")
 
-        sample_rate, samples, bitrate, audio = read_audio(_INPUT_TEST_MP3,
+        sample_rate, samples, bitrate = read_audio(_INPUT_TEST_MP3,
                                                            format='mp3')
         channel = samples[:, 0].astype(np.float32)
         start = 7 * sample_rate
@@ -842,7 +840,7 @@ class TestFeed(unittest.TestCase):
         if not os.path.exists(_INPUT_TEST_MP3):
             self.skipTest("input_test.mp3 reference asset not present")
 
-        sample_rate, samples, bitrate, audio = read_audio(_INPUT_TEST_MP3,
+        sample_rate, samples, bitrate = read_audio(_INPUT_TEST_MP3,
                                                            format='mp3')
         channel = samples[:, 0].astype(np.float64)
         expanded = new_interpolation_algorithm(channel, upscale_factor=4)
@@ -1043,7 +1041,7 @@ class TestFeed(unittest.TestCase):
         if not os.path.exists(_INPUT_TEST_MP3):
             self.skipTest("input_test.mp3 reference asset not present")
 
-        sample_rate, samples, bitrate, audio = read_audio(_INPUT_TEST_MP3,
+        sample_rate, samples, bitrate = read_audio(_INPUT_TEST_MP3,
                                                            format='mp3')
         channel = samples[:, 0].astype(np.float64)
         expanded = new_interpolation_algorithm(channel, upscale_factor=7)
@@ -1244,10 +1242,11 @@ class TestFeed(unittest.TestCase):
         mock_audio = MagicMock()
         mock_audio.channels = 2
         rng = np.random.default_rng(7)
-        flat_samples = (rng.integers(-3000, 3000, size=n_frames * 2)
+        flat_samples = (rng.integers(-3000, 3000, size=(n_frames, 2))
                        .astype(np.int16))
+        print(flat_samples.ndim)
         mock_audio.get_array_of_samples.return_value = flat_samples
-        mock_read_audio.return_value = (sample_rate, None, None, mock_audio)
+        mock_read_audio.return_value = (sample_rate, flat_samples, None)
 
         original_nyquist = sample_rate / 2.0
 

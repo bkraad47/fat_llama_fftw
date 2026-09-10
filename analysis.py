@@ -1,16 +1,15 @@
 import matplotlib.pyplot as plt
+import soundfile as sf
 import numpy as np
 import scipy.signal as signal
-from pydub import AudioSegment
 import soundfile as sf
 
 def read_mp3(file_path):
-    audio = AudioSegment.from_mp3(file_path)
-    data = np.array(audio.get_array_of_samples())
-    if audio.channels == 2:
+    data, frame_rate = sf.read(file_path)
+    if data.ndim == 2:
         data = data.reshape((-1, 2))
         data = data.mean(axis=1)  # Convert to mono
-    return data, audio.frame_rate
+    return data, frame_rate
 
 def read_flac(file_path):
     data, sample_rate = sf.read(file_path)

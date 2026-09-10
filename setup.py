@@ -2,16 +2,18 @@ from setuptools import setup, find_packages
 
 setup(
     name='fat_llama_fftw',
-    version='1.4.1',
+    version='1.4.2',
     packages=find_packages(),
     install_requires=[
         'numpy',
         'pyfftw',
-        'pydub',
         'soundfile',
         'mutagen',
         'scipy',
     ],
+    extras_require={
+        'tests': 'pydub'
+    },
     package_data={
         'fat_llama_fftw': ['audio_fattener/*.py', 'tests/*.py'],
     },
