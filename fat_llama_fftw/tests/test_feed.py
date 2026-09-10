@@ -1,6 +1,6 @@
 import os
 import unittest
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 import numpy as np
 from fat_llama_fftw.audio_fattener.feed import (
     read_audio,
@@ -48,14 +48,85 @@ class TestFeed(unittest.TestCase):
         self.assertEqual(samples.shape, (44100 * 4 // 2, 2))
         # The bitrate must be the one reported by the MP3 tag reader, not None.
         self.assertEqual(bitrate, 1411000)
-        # The returned AudioSegment must be the decoded object itself.
-        #self.assertIs(audio, mock_audio)
-        # Stereo de-interleaving must preserve sample content and ordering:
-        # the flat array is [L0, R0, L1, R1, ...].
+        # read_audio returns exactly what soundfile decoded, in soundfile's
+        # own (frames, channels) shape - no de-interleaving/reshape of its
+        # own (that was a pydub-era step, removed this cycle along with the
+        # hardcoded reshape((-1, 2)) that corrupted >2-channel sources).
+        # Sample content and per-channel ordering must survive untouched.
         expected = np.arange(44100 * 4, dtype=np.int16).reshape((-1, 2))
         np.testing.assert_array_equal(samples, expected)
         # Duration implied by the returned samples must match the source.
         self.assertAlmostEqual(samples.shape[0] / sample_rate, 2.0, places=6)
+
+    @patch('fat_llama_fftw.audio_fattener.feed.sf.read')
+    @patch('os.path.exists', return_value=True)
+    def test_read_audio_unsupported_format_computes_bitrate_from_duration(
+            self, mock_exists, mock_read):
+        # Regression test for a confirmed bug (3 consecutive /test-fat-llama
+        # runs): the `else` branch (an uncatalogued/unsupported format - no
+        # mutagen reader above matches it) referenced an undefined name
+        # `audio`, a pydub-era `AudioSegment` leftover from before read_audio
+        # was rewritten to use `soundfile.read` directly - pydub's
+        # AudioSegment supported `len()` in milliseconds, soundfile's return
+        # values have no equivalent object, so `audio` was never bound and
+        # this branch raised NameError unconditionally. Verified live before
+        # the fix: `read_audio(path, 'aiff')` raised
+        # `NameError: name 'audio' is not defined` instead of computing a
+        # duration-based bitrate estimate like the fix below does.
+        sample_rate = 44100
+        n_frames = sample_rate * 2  # 2 seconds
+        samples = np.zeros((n_frames, 2), dtype=np.float64)
+        mock_read.return_value = (samples, sample_rate)
+
+        # 'aiff' matches none of the 'mp3'/'flac'/'ogg'/'wav' branches, so
+        # this must fall through to the else branch under test.
+        result_sr, result_samples, bitrate = read_audio('in.aiff', 'aiff')
+
+        self.assertEqual(result_sr, sample_rate)
+        self.assertIsNotNone(bitrate)
+        self.assertTrue(np.isfinite(bitrate))
+        self.assertGreater(bitrate, 0)
+        # duration_seconds = len(samples) / sample_rate = 2.0 exactly here,
+        # so bitrate = (n_frames * 8) / 2.0 - assert the exact value, not
+        # just "some positive number", so a future regression to a wrong
+        # formula (e.g. reintroducing a stray /1000.0 unit conversion, a
+        # pydub-era artifact for milliseconds that has no meaning against
+        # samples/sample_rate) would be caught.
+        expected_bitrate = (n_frames * 8) / 2.0
+        self.assertAlmostEqual(bitrate, expected_bitrate, places=6)
+
+    @patch('fat_llama_fftw.audio_fattener.feed.WAVE')
+    @patch('fat_llama_fftw.audio_fattener.feed.sf.read')
+    @patch('os.path.exists', return_value=True)
+    def test_read_audio_does_not_corrupt_channel_counts_above_stereo(
+            self, mock_exists, mock_read, mock_wave):
+        # Regression test for a confirmed bug (3 consecutive /test-fat-llama
+        # runs): read_audio used to unconditionally do
+        # `samples.reshape((-1, 2))` whenever samples.ndim == 2. soundfile
+        # already returns (frames, channels) directly (unlike pydub's flat,
+        # interleaved get_array_of_samples() output, which genuinely needed
+        # a manual reshape) - so this was a no-op for mono/stereo, but for
+        # any source with more than 2 channels it forcibly reshaped a
+        # (frames, n_channels) array into (-1, 2), either raising (when
+        # frames * n_channels is not evenly divisible by 2) or silently
+        # reinterleaving unrelated channels' samples into the wrong shape.
+        # A real N-channel (N > 2) array must come back byte-for-byte
+        # unchanged. Uses format='wav' (a cataloged branch, WAVE mocked)
+        # rather than an uncatalogued format, so this test exercises only
+        # the reshape bug in isolation and does not depend on the separate
+        # NameError fix in the `else` branch above.
+        sample_rate = 48000
+        n_frames = 10
+        n_channels = 4
+        rng = np.random.default_rng(5)
+        samples = rng.standard_normal((n_frames, n_channels))
+        mock_read.return_value = (samples, sample_rate)
+        mock_wave.return_value.info.bitrate = 4000000
+
+        result_sr, result_samples, bitrate = read_audio('in.wav', 'wav')
+
+        self.assertEqual(result_samples.shape, (n_frames, n_channels))
+        np.testing.assert_array_equal(result_samples, samples)
 
     @patch('fat_llama_fftw.audio_fattener.feed.sf.write')
     def test_write_audio(self, mock_write):
@@ -338,7 +409,6 @@ class TestFeed(unittest.TestCase):
             new_interpolation_algorithm(channels[:, i], upscale_factor)
             for i in range(channels.shape[1])
         ])
-        self.assertGreater(float(np.max(np.abs(output - interpolated))), 0.0)
         for i in range(channels.shape[1]):
             interp_peak = float(np.max(np.abs(interpolated[:, i])))
             self.assertGreater(interp_peak, 0.0)
@@ -746,6 +816,85 @@ class TestFeed(unittest.TestCase):
         # of the input's own peak.
         max_diff = np.max(np.abs(ist_changes - sig))
         self.assertGreater(max_diff, 0.05 * np.max(np.abs(sig)))
+
+    def test_ist_pipeline_is_scale_invariant_within_float32_precision(self):
+        # This cycle's DIRECTIVES flagged a suspected fp32 precision
+        # regression from read_audio's pydub -> soundfile rewrite: pydub's
+        # get_array_of_samples() returned raw int16-range integers (peaks
+        # in the tens of thousands), while soundfile.read()'s default
+        # float64 dtype returns samples normalized to roughly [-1, 1] - a
+        # real change in the numeric scale everything downstream operates
+        # on, several stages of which (.astype(np.float32) at various
+        # points) work in single precision.
+        #
+        # Empirical investigation this cycle (not just architectural
+        # reasoning) found the pipeline's threshold/scale math
+        # (initialize_ist, perform_ist_iteration, _cap_ist_changes_to_
+        # baseline_peak) is written entirely as a fraction of each array's
+        # own peak, so it is scale-invariant by design: on a real 3s loud
+        # slice of input_test.mp3 (soundfile's native peak ~1.11) vs. the
+        # same content emulated at the old pydub-style int16 scale (peak
+        # ~36406, i.e. x32767), initialize_ist's boolean threshold mask and
+        # perform_ist_iteration's FFT-domain kept-bin mask were BIT-
+        # IDENTICAL across scales, and the full iterative_soft_thresholding
+        # output (rescaled to a common frame) differed by only ~9.4e-8
+        # relative - right at float32's own ~1.19e-7 relative epsilon, i.e.
+        # pure rounding noise, not a real quality-affecting difference.
+        # (Separately measured: soundfile's MP3 decoder already produces
+        # float32-quantized sample values internally, so the *new* scale's
+        # own raw float32 downcast loses zero additional precision on this
+        # file - if anything the old emulated int16 scale showed marginally
+        # *more* float32 downcast error here, from the x32767 multiplication
+        # itself landing off the float32 grid.)
+        #
+        # This is a smaller synthetic reproduction of that same finding
+        # (kept fast/deterministic rather than depending on the repo's
+        # input_test.mp3 reference asset), asserting the two scale-invariance
+        # claims directly so a future change to the threshold/scale math
+        # (e.g. introducing an absolute, non-peak-relative comparison) would
+        # be caught here rather than only via a one-off investigation script.
+        rng = np.random.default_rng(42)
+        n = 6000
+        t = np.arange(n) / 44100.0
+        # Mixed tonal + noise content, deliberately not int-exact, so this
+        # exercises genuine floating-point rounding rather than an
+        # accidentally-exact fixture.
+        sig_new_scale = (0.6 * np.sin(2 * np.pi * 440 * t)
+                        + 0.2 * np.sin(2 * np.pi * 3000 * t)
+                        + 0.05 * rng.standard_normal(n))
+        SCALE = 32767.0
+        sig_old_scale = sig_new_scale * SCALE
+        threshold = 0.6
+
+        new_thres = initialize_ist(sig_new_scale.astype(np.float32),
+                                   threshold)
+        old_thres = initialize_ist(sig_old_scale.astype(np.float32),
+                                   threshold)
+        np.testing.assert_array_equal(new_thres != 0, old_thres != 0)
+
+        new_fft = np.fft.fft(new_thres.astype(np.float64))
+        old_fft = np.fft.fft(old_thres.astype(np.float64))
+        new_mask = np.abs(new_fft) > threshold * np.max(np.abs(new_fft))
+        old_mask = np.abs(old_fft) > threshold * np.max(np.abs(old_fft))
+        np.testing.assert_array_equal(new_mask, old_mask)
+
+        new_out = iterative_soft_thresholding(
+            sig_new_scale.astype(np.float32), max_iter=50,
+            threshold=threshold)
+        old_out = iterative_soft_thresholding(
+            sig_old_scale.astype(np.float32), max_iter=50,
+            threshold=threshold)
+        old_out_rescaled = old_out.astype(np.float64) / SCALE
+        new_peak = np.max(np.abs(new_out))
+        self.assertGreater(new_peak, 0)
+        rel_diff = (np.max(np.abs(new_out.astype(np.float64)
+                                  - old_out_rescaled)) / new_peak)
+        # Measured directly (this fixture): ~9e-8, at float32 epsilon. 1e-4
+        # gives ~1000x headroom above that measurement while still catching
+        # a genuine scale-dependent regression (which prior investigation
+        # found would show up as orders of magnitude larger, e.g. differing
+        # threshold masks entirely).
+        self.assertLess(rel_diff, 1e-4)
 
     def test_perform_ist_iteration_never_keeps_dc_bin(self):
         # Regression test for the cycle-2 DC-offset regression found by
@@ -1239,14 +1388,18 @@ class TestFeed(unittest.TestCase):
         # tiny synthetic signal without touching the filesystem.
         sample_rate = 8000
         n_frames = 20
-        mock_audio = MagicMock()
-        mock_audio.channels = 2
         rng = np.random.default_rng(7)
-        flat_samples = (rng.integers(-3000, 3000, size=(n_frames, 2))
-                       .astype(np.int16))
-        print(flat_samples.ndim)
-        mock_audio.get_array_of_samples.return_value = flat_samples
-        mock_read_audio.return_value = (sample_rate, flat_samples, None)
+        # Coherence fix (audio-quality-checker): this fixture used to be
+        # raw int16-range integers plus an unused pydub `AudioSegment`
+        # MagicMock - both leftovers from before read_audio was rewritten
+        # onto soundfile. read_audio can no longer return either: it hands
+        # back soundfile.read's own float64 samples, normalized to roughly
+        # [-1, 1]. Mocking a return value the real function cannot produce
+        # is exactly the kind of stale fixture that hides a scale-dependent
+        # regression in the stage under test, so mock what read_audio
+        # actually returns now.
+        samples = rng.uniform(-0.9, 0.9, size=(n_frames, 2))
+        mock_read_audio.return_value = (sample_rate, samples, None)
 
         original_nyquist = sample_rate / 2.0
 
@@ -1306,6 +1459,97 @@ class TestFeed(unittest.TestCase):
             energy_below = float(np.sum(spectrum[~above] ** 2))
             self.assertGreater(energy_below, 0)
             self.assertLess(energy_above, energy_below * 1e-6)
+
+    @patch.object(feed_module, 'write_audio')
+    @patch.object(feed_module, 'read_audio')
+    def test_upscale_clamps_upscale_factor_to_one_for_high_bitrate_source(
+            self, mock_read_audio, mock_write_audio):
+        # Regression test for a confirmed crash (this cycle's one remaining
+        # finding): `upscale_factor = round(target_bitrate / bitrate)` had
+        # no lower bound. A 96kHz/24-bit stereo source (a legitimate,
+        # plausible input - lossless WAV/FLAC sources are supported per
+        # project-mission.md) reports a raw PCM bitrate of
+        # 96000 * 24 * 2 = 4,608,000 bps; against the pinned baseline's
+        # target_bitrate_kbps=1400 (target_bitrate=1,400,000),
+        # round(1400000 / 4608000) == 0, and new_interpolation_algorithm
+        # (which only special-cases upscale_factor==1, not 0) crashed
+        # trying to broadcast its full-length rfft spectrum into a
+        # 1-element array: "could not broadcast input array from shape
+        # (N,) into shape (1,)". Verified directly (this cycle, before the
+        # fix): calling new_interpolation_algorithm(data, upscale_factor=0)
+        # on a 96000-sample array reproduces exactly this error, with
+        # N=48001 (that array's own rfft length).
+        sample_rate = 96000
+        n_frames = 64
+        rng = np.random.default_rng(13)
+        samples = rng.uniform(-0.5, 0.5, size=(n_frames, 2))
+        source_bitrate = sample_rate * 24 * 2  # 24-bit stereo PCM
+        mock_read_audio.return_value = (sample_rate, samples, source_bitrate)
+
+        with self.assertLogs(feed_module.logger, level='WARNING') as cm:
+            upscale(
+                input_file_path='in.wav',
+                output_file_path='out.flac',
+                source_format='wav',
+                target_format='flac',
+                max_iterations=5,
+                threshold_value=0.6,
+                target_bitrate_kbps=1400
+            )
+
+        # A clear, explanatory warning must have been logged - not a
+        # silent clamp and not the cryptic broadcast ValueError.
+        self.assertTrue(
+            any('upscale factor' in msg.lower() or 'upscale_factor'
+                in msg.lower() for msg in cm.output),
+            f"expected an explanatory warning about the clamp, got: "
+            f"{cm.output}")
+
+        mock_write_audio.assert_called_once()
+        write_args, write_kwargs = mock_write_audio.call_args
+        written_data = write_args[2]
+        self.assertTrue(np.all(np.isfinite(written_data)))
+        # upscale_factor must have been clamped to 1 - no sample-rate
+        # increase, but no crash either, and the frame count must match
+        # the (unscaled) source exactly.
+        new_sample_rate = write_args[1]
+        self.assertEqual(new_sample_rate, sample_rate)
+        self.assertEqual(written_data.shape[0], n_frames)
+
+    @patch.object(feed_module, 'write_audio')
+    @patch.object(feed_module, 'read_audio')
+    def test_upscale_factor_one_from_moderately_high_bitrate_source_no_warning(
+            self, mock_read_audio, mock_write_audio):
+        # Companion case named in this cycle's finding: a 44100Hz/24-bit
+        # stereo source (bitrate 44100 * 24 * 2 = 2,116,800 bps) against the
+        # same target_bitrate_kbps=1400 already rounds to exactly 1 -
+        # round(1400000 / 2116800) == 1 - pre-fix, so this path is not the
+        # crash and must not regress into treating a naturally-computed
+        # upscale_factor=1 as if it were a clamp: no warning should fire
+        # here, since raw_upscale_factor was never below 1 to begin with.
+        sample_rate = 44100
+        n_frames = 64
+        rng = np.random.default_rng(17)
+        samples = rng.uniform(-0.5, 0.5, size=(n_frames, 2))
+        source_bitrate = sample_rate * 24 * 2
+        mock_read_audio.return_value = (sample_rate, samples, source_bitrate)
+
+        with patch.object(feed_module.logger, 'warning') as warn_spy:
+            upscale(
+                input_file_path='in.wav',
+                output_file_path='out.flac',
+                source_format='wav',
+                target_format='flac',
+                max_iterations=5,
+                threshold_value=0.6,
+                target_bitrate_kbps=1400
+            )
+        warn_spy.assert_not_called()
+
+        mock_write_audio.assert_called_once()
+        write_args, write_kwargs = mock_write_audio.call_args
+        new_sample_rate = write_args[1]
+        self.assertEqual(new_sample_rate, sample_rate)  # factor 1, unclamped
 
     @patch.object(feed_module, 'write_audio')
     def test_upscale_output_never_exceeds_full_scale(self, mock_write_audio):
@@ -1393,6 +1637,78 @@ class TestFeed(unittest.TestCase):
             energy_below = float(np.sum(spectrum[~above] ** 2))
             self.assertGreater(energy_below, 0)
             self.assertLess(energy_above, energy_below * 1e-9)
+
+    def test_upscale_writes_valid_flac_end_to_end_on_disk(self):
+        # Coverage gap flagged this cycle (DIRECTIVES priority 3, item 6):
+        # every existing end-to-end upscale() test (e.g.
+        # test_upscale_wires_apply_nyquist_cutoff,
+        # test_upscale_output_never_exceeds_full_scale above) mocks
+        # write_audio, so nothing in the suite exercises upscale() with a
+        # genuinely unmocked write_audio -> soundfile.write call, or reads
+        # the result back off disk the way a real caller (e.g. example.py)
+        # would. This runs the real, unmocked upscale() against the repo's
+        # own input_test.mp3 reference asset, writes an actual FLAC file to
+        # a temp directory, and verifies its on-disk properties directly
+        # via soundfile/mutagen - the same tools a caller would use, not
+        # feed.py's own internals.
+        if not os.path.exists(_INPUT_TEST_MP3):
+            self.skipTest("input_test.mp3 reference asset not present")
+
+        import tempfile
+        import soundfile as sf
+        from mutagen.flac import FLAC
+
+        source_sr, source_samples, source_bitrate = read_audio(
+            _INPUT_TEST_MP3, format='mp3')
+        source_n_frames = source_samples.shape[0]
+        source_n_channels = source_samples.shape[1]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            output_path = os.path.join(tmp, 'output_test.flac')
+            upscale(
+                input_file_path=_INPUT_TEST_MP3,
+                output_file_path=output_path,
+                source_format='mp3',
+                target_format='flac',
+                max_iterations=50,
+                threshold_value=0.6,
+                target_bitrate_kbps=1411,
+            )
+
+            self.assertTrue(os.path.exists(output_path))
+            upscale_factor = 7  # 1411kbps / 192kbps source, rounded
+
+            info = sf.info(output_path)
+            self.assertEqual(info.samplerate, source_sr * upscale_factor)
+            self.assertEqual(info.channels, source_n_channels)
+            self.assertEqual(info.subtype, 'PCM_24')
+            self.assertEqual(FLAC(output_path).info.bits_per_sample, 24)
+            # Duration must be preserved (more samples per second at the
+            # same wall-clock length is the whole point of an upscale).
+            self.assertAlmostEqual(
+                info.duration, source_n_frames / source_sr, places=3)
+
+            written, written_sr = sf.read(output_path, always_2d=True)
+            self.assertEqual(written_sr, source_sr * upscale_factor)
+            self.assertEqual(written.shape[1], source_n_channels)
+            self.assertTrue(np.all(np.isfinite(written)))
+            peak = float(np.max(np.abs(written)))
+            self.assertAlmostEqual(peak, 1.0, places=5)
+            self.assertEqual(int(np.sum(np.abs(written) > 1.0)), 0)
+
+            # project-mission.md's hard constraint, verified on the actual
+            # on-disk written file (not an intermediate in-memory array).
+            original_nyquist = source_sr / 2.0
+            for ch in range(written.shape[1]):
+                spectrum = np.abs(np.fft.rfft(written[:, ch].astype(
+                    np.float64)))
+                freqs = np.fft.rfftfreq(written.shape[0],
+                                        d=1.0 / written_sr)
+                above = freqs > original_nyquist
+                energy_above = float(np.sum(spectrum[above] ** 2))
+                energy_below = float(np.sum(spectrum[~above] ** 2))
+                self.assertGreater(energy_below, 0)
+                self.assertLess(energy_above, energy_below * 1e-6)
 
     def test_normalize_signal(self):
         signal = np.array([1, 2, 3, 4], dtype=np.float32)

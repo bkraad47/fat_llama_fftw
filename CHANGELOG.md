@@ -2,6 +2,23 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.4.3] - 2026-09-10
+
+`iterate-fat-llama` run (2 cycles, early stop) verifying and completing the pydub removal introduced in 1.4.2. Coherence and spectral deviation confirmed at or above the pre-removal baseline (9.5/9.9): this run measured 9.8/9.8, with the remaining 0.1 spectral-deviation gap traced to the committed reference asset itself, not a regression.
+
+### Fixed
+
+- **Investigated a suspected precision regression from the `pydub` removal and confirmed it was not one.** `read_audio` moved from `pydub` (which returned raw integer PCM samples, e.g. int16 range) to `soundfile` (which returns normalized float64 samples in `[-1, 1]` by default) — a real change in numeric scale flowing through the whole pipeline. Verified empirically that every threshold/scale computation downstream is genuinely scale-invariant as designed: the difference between the old and new scales lands at float32's own rounding epsilon, not a measurable quality loss. If anything, the new path loses zero *additional* precision versus the old one, since `soundfile`'s MP3 decoder already produces float32-quantized values internally.
+- **Fixed a crash introduced by the `pydub` removal:** `read_audio`'s fallback branch for uncatalogued formats referenced a variable that no longer exists post-migration, raising a `NameError` instead of computing a duration estimate.
+- **Fixed a silent data-corruption bug introduced by the `pydub` removal:** a leftover reshape step hardcoded audio to 2 channels regardless of the source's actual channel count — harmless for mono/stereo, but would have silently corrupted any source with more than 2 channels.
+- **Fixed a crash on high-bitrate sources**, unrelated to the `pydub` removal but found while verifying it: a lossless source (e.g. 96kHz/24-bit WAV) with a bitrate already exceeding the requested target could compute an upscale factor of zero, crashing the interpolation step. The factor now has a floor of 1, with a clear log message explaining when and why no upsampling occurs, rather than a cryptic crash.
+- Added a real, fully unmocked end-to-end test that writes an actual FLAC file and verifies its on-disk properties — previously every end-to-end test mocked the file-writing step, so a container/subtype/channel-interleaving regression could have passed the whole suite undetected. Minor test-suite cleanup (a stray debug print, a redundant assertion) alongside.
+
+### Known remaining gaps
+
+- `.claude/agents/rules/audio-quality.md`'s pinned test-baseline configuration is out of sync with `example.py` and this package's actual `upscale()` signature — this is a project-tooling file outside this pipeline's own write scope; needs a direct human edit.
+- The committed reference asset `input_test.flac` is a legacy output of an earlier (zero-order-hold-era) version of this pipeline, not an independent lossless master — it now carries content above the original Nyquist frequency that the current, correct pipeline properly excludes, which is why spectral-deviation scoring against it has a small, expected ceiling below what a clean master would allow.
+
 ## [1.4.2] - 2026-09-09
 
 ### Changed
