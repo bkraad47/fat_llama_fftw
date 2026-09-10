@@ -84,12 +84,31 @@ def read_audio(file_path, format):
         wav_info = WAVE(file_path)
         bitrate = wav_info.info.bitrate
     else:
-        duration_seconds = len(audio) / 1000.0
+        # Uncatalogued/unsupported format (no mutagen reader above matched):
+        # estimate a bitrate from the decoded samples themselves rather than
+        # a container tag. This used to reference `audio` - a pydub-era
+        # `AudioSegment` whose `len()` returned milliseconds - but that
+        # object no longer exists now that read_audio decodes via
+        # `soundfile.read` directly, so `audio` was never bound and this
+        # branch raised NameError unconditionally. `samples`' own length
+        # (frames, for both the 1-D mono and 2-D multi-channel case
+        # soundfile returns) divided by sample_rate gives the same duration
+        # in seconds without needing a pydub object at all.
+        duration_seconds = len(samples) / sample_rate
         bitrate = (len(samples) * 8) / duration_seconds
 
-    if samples.ndim == 2:
-        samples = samples.reshape((-1, 2))
-
+    # soundfile.read already returns samples shaped (frames,) for mono or
+    # (frames, channels) for any channel count - unlike pydub's
+    # get_array_of_samples (a flat, interleaved 1-D array that genuinely
+    # needed a manual reshape into (frames, channels)). A hardcoded
+    # `reshape((-1, 2))` here was a no-op for mono/stereo (soundfile's shape
+    # already matches) but would silently corrupt any source with more than
+    # 2 channels - forcing a 3+-channel (frames, n) array's flat buffer into
+    # (-1, 2) either fails outright (odd total element count) or reinterleaves
+    # completely unrelated channels' samples into the wrong shape. Removing
+    # it entirely lets read_audio return whatever channel count soundfile
+    # decoded, matching upscale()'s own downstream handling (which is
+    # already channel-count-generic via channels.T in upscale_channels).
     return sample_rate, samples, bitrate
 
 
@@ -574,6 +593,20 @@ def upscale(
         threshold_value=0.6,
         target_bitrate_kbps=1411
     ):
+    # target_bitrate_kbps only ever feeds the discrete upscale_factor
+    # computed below (round(target_bitrate_kbps * 1000 / source_bitrate)) -
+    # it is an *input* used to pick how many times to upsample, not a rate
+    # control on the file this function writes. The actual delivered
+    # bitrate of a written FLAC/WAV is a function of its sample rate, bit
+    # depth, and (for FLAC) lossless-compression content - none of which
+    # target_bitrate_kbps constrains directly - so the real output bitrate
+    # can, and typically will, land well outside this parameter's own
+    # valid_bitrate_ranges validation window below (e.g. a real
+    # ~4.7M-sample post-upscale FLAC has measured ~2900+ kbps against a
+    # requested 1400). valid_bitrate_ranges therefore only ever validates
+    # the requested target_bitrate_kbps parameter itself (keeping the
+    # upscale_factor derivation in a sane band), not a promise about what
+    # the written file's own bitrate will measure as.
     valid_bitrate_ranges = {
         'flac': (800, 1411),
         'wav': (800, 6444),

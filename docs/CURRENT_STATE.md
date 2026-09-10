@@ -40,16 +40,16 @@ fat_llama_fftw/  (repo root)
 ## fat_llama_fftw/audio_fattener/feed.py
 
 ### `read_audio(file_path, format) -> tuple`
-**File:** fat_llama_fftw/audio_fattener/feed.py:18
+**File:** fat_llama_fftw/audio_fattener/feed.py:67
 **Kind:** function
-**Description:** Reads an audio file of the given format, extracts its raw samples as a numpy array, its sample rate, and (where the format's tag library supports it) its bitrate. Falls back to computing an approximate bitrate from sample count/duration for formats mutagen doesn't report bitrate for directly.
+**Description:** **Rewritten on the `DannieDarko_main` fork branch (not part of this project's own iterate-fat-llama history) to drop the `pydub` dependency**, reading via `soundfile.read(file_path)` directly instead of `pydub.AudioSegment.from_file(...).get_array_of_samples()`. **Load-bearing scale change, under active investigation this cycle:** `soundfile.read()`'s default `dtype` is `'float64'`, returning samples normalized to `[-1.0, 1.0]` — `pydub`'s `get_array_of_samples()` instead returned raw integer PCM values (e.g. int16 range `±32767`). Every downstream threshold/scale computation in this pipeline (`initialize_ist`, `perform_ist_iteration`, `_cap_ist_changes_to_baseline_peak`) is written as a fraction of each array's own peak, so it should be scale-invariant in principle — but several pipeline stages `.astype(np.float32)` intermediate results, and this cycle's directive flags a suspected fp32 precision regression from the scale change that needs empirical verification, not just architectural review. Also accepts file-like objects, not just path strings (`isinstance(file_path, str)` guards the `os.path.exists` check). **Known bug, unfixed:** the `else` branch (unsupported/uncatalogued format) at line 87 references an undefined name `audio` (a `pydub`-era leftover — should reference `samples`) — raises `NameError` instead of computing a duration-based bitrate estimate.
 **Parameters:**
-- `file_path` (`str`): path to the input audio file. Raises `FileNotFoundError` if it doesn't exist.
-- `format` (`str`): one of `'mp3'`, `'flac'`, `'ogg'`, `'wav'` (or any other format `pydub`/ffmpeg can decode, with an approximated bitrate).
-**Returns:** `(sample_rate: int, samples: np.ndarray, bitrate: float|None, audio: pydub.AudioSegment)` — `samples` is reshaped to `(-1, 2)` for stereo input.
+- `file_path` (`str` or file-like object): path to the input audio file, or an open file-like object. Raises `FileNotFoundError` if a path string doesn't exist.
+- `format` (`str`): one of `'mp3'`, `'flac'`, `'ogg'`, `'wav'` (or any other format `soundfile`/`libsndfile` can decode — the `else` branch for those is currently broken, see above).
+**Returns:** `(sample_rate: int, samples: np.ndarray, bitrate: float|None)` — no longer returns the `audio` object (that was a `pydub.AudioSegment`, which no longer exists in this implementation). **Known bug, unfixed:** `if samples.ndim == 2: samples = samples.reshape((-1, 2))` at lines 90-91 hardcodes 2 channels — a no-op for mono/stereo (`soundfile` already returns `(frames, channels)` shape for multi-channel), but would silently corrupt any source with more than 2 channels.
 **Usage:**
 ```python
-sample_rate, samples, bitrate, audio = read_audio('input_test.mp3', format='mp3')
+sample_rate, samples, bitrate = read_audio('input_test.mp3', format='mp3')
 ```
 
 ### `write_audio(file_path, sample_rate, data, format) -> None`
@@ -402,3 +402,15 @@ compare_signals(mp3, flac, sr1)
 - **Still open, methodology/human decision, not a source bug:** the repo-root reference asset `input_test.flac` is itself a stale output of this same pipeline from *before* the cycle-1 Nyquist-cutoff fix, so it still carries above-Nyquist imaging — `audio-quality-checker`'s spectral-deviation score partly measures agreement with this defective reference rather than fidelity to an independent lossless master. Regenerating it needs a human/methodology decision (e.g. sourcing a true lossless master), not a `generate-code` edit.
 - **Still open, environment issue, not a source bug:** a stale `pip install`-ed copy of `fat_llama_fftw` exists in this environment's `venv/Lib/site-packages/`, which can shadow the working tree's own package when a script is run with the working tree not first on `sys.path` — `audio-quality-checker` hit this on its first cycle-2 attempt (silently ran pre-fix code). Needs `pip install -e .` / reinstall in this environment; not a file for any skill/agent to edit.
 - `upscale()` end-to-end coverage is now present (`test_upscale_wires_apply_nyquist_cutoff`, cycle 2) but only for the Nyquist-cutoff wiring specifically — no test yet exercises the full `upscale()` call against a real (or fully synthetic) audio file end-to-end for output correctness generally.
+
+## DannieDarko_main fork branch — additional changes, this cycle's targets
+
+On top of the shipped v1.4.1 base, this branch (not part of this project's own history until this run) also: parallelizes `upscale_channels` per-channel work across a `ThreadPoolExecutor` for stereo (factored into a new `_process_channel` helper; verified bit-identical to sequential), and requests multiple `pyfftw` threads for `apply_nyquist_cutoff`'s large transforms via a new `_fft_thread_count(n)` helper (`_MULTI_THREAD_FFT_MIN_SAMPLES=200_000` threshold) — both are `.claude/CLAUDE.md`-external prior work, carried over from the fork, not yet verified against this project's own coherence/spectral-deviation bar.
+
+**Open items this cycle must address** (per DIRECTIVES and 3 consecutive `/test-fat-llama` runs on this branch):
+1. **fp32/scale investigation (new, DIRECTIVES-flagged):** the `pydub`→`soundfile` swap in `read_audio` changed the numeric scale of `samples` from raw int16-range integers to normalized `float64` in `[-1, 1]` — verify this doesn't introduce a precision regression anywhere `.astype(np.float32)` is used downstream, and that coherence/spectral_deviation scores stay at or above the v1.4.1 baseline (coherence 9.5, spectral_deviation 9.9).
+2. `read_audio`'s undefined-`audio`-variable `NameError` in its unsupported-format branch (see factblock above).
+3. `read_audio`'s hardcoded-2-channel reshape (see factblock above).
+4. `target_bitrate_kbps` doesn't bound the real output bitrate — `upscale()`'s own FLAC validation range `(800, 1411)` only ever applies to the input parameter, never the delivered file (measured actual output: 2932.85 kbps against a requested 1400).
+5. Test hygiene: a stray debug `print(flat_samples.ndim)` in test_feed.py, a superseded assertion, `pydub` still imported by tests but removed from `requirements.txt` (only in `setup.py`'s `extras_require['tests']`) so a plain `pip install -r requirements.txt` can't run the suite.
+6. No test asserts a real, on-disk end-to-end `upscale()` output — every end-to-end test mocks `write_audio`.
