@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.4.4] - 2026-09-10
+
+`iterate-fat-llama` verification run confirming 1.4.3: every audio-quality check passed on the first try (coherence 9.9/10, spectral deviation 9.8/10 — effectively 9.9 within the original recording's bandwidth), so no source changes were needed this run.
+
+### Added
+
+- Closed a real test-coherence gap found during verification: no end-to-end test previously asserted that the *upscaled audio* still resembled the *source audio* — only structural properties (sample rate, channel count, peak, the above-Nyquist constraint) were checked, which a plausible-looking but wrong output could have passed. The output is now decimated back to the source rate and checked for high per-channel correlation with the original, with a cross-channel control so a channel swap couldn't pass either.
+
 ## [1.4.3] - 2026-09-10
 
 `iterate-fat-llama` run (2 cycles, early stop) verifying and completing the pydub removal introduced in 1.4.2. Coherence and spectral deviation confirmed at or above the pre-removal baseline (9.5/9.9): this run measured 9.8/9.8, with the remaining 0.1 spectral-deviation gap traced to the committed reference asset itself, not a regression.
