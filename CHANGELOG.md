@@ -2,6 +2,26 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.4.5] - 2026-09-13
+
+Documentation-only pass reconciling README.md with the actual current pipeline in `feed.py` — no source or test changes.
+
+### Fixed
+
+- **Removed a fictitious "Adaptive Filtering" step from the Algorithm Explanation.** README described a block-adaptive LMS filter stage that has never existed in `feed.py` — `upscale()` has no `lms_filter` call and no `toggle_adaptive_filter`/`toggle_normalize`/`toggle_autoscale` flags (this parameter set only exists on the CUDA sibling package and, separately, in `.claude/agents/rules/audio-quality.md`'s own stale pinned baseline — a known, previously-documented gap, left as-is since that file is outside this pass's write scope).
+- **Corrected the Calculating Upscale Factor step**, which claimed the factor is clamped to a 192kHz sample-rate ceiling. The actual code only floors it at 1 (never scales below the source's own resolution or crashes on a high-bitrate source); there is no upper clamp anywhere in `feed.py`.
+- **Re-ordered and re-described the remaining Algorithm Explanation steps to match `upscale()`'s real execution order**: interpolate -> IST (block/WOLA, peak-capped) -> auto-scale amplitude -> Nyquist cutoff -> normalize -> write. Normalizing now correctly reads as the last step (it runs after the Nyquist cutoff so the brick-wall filter's own overshoot can't push a sample above full scale), not before a nonexistent filtering step.
+- Fixed two broken image/changelog links using a `fat_llama_fttw` typo instead of `fat_llama_fftw` (the "How it Works" diagram and the raw CHANGELOG.md link).
+- Synced the README's "Example Usage" code snippet with `example.py`'s actual current call (`max_iterations=600, threshold_value=0.75`) — README had never been updated when `example.py` was deliberately changed to these values back in 1.4.1.
+
+## [1.4.4] - 2026-09-10
+
+`iterate-fat-llama` verification run confirming 1.4.3: every audio-quality check passed on the first try (coherence 9.9/10, spectral deviation 9.8/10 — effectively 9.9 within the original recording's bandwidth), so no source changes were needed this run.
+
+### Added
+
+- Closed a real test-coherence gap found during verification: no end-to-end test previously asserted that the *upscaled audio* still resembled the *source audio* — only structural properties (sample rate, channel count, peak, the above-Nyquist constraint) were checked, which a plausible-looking but wrong output could have passed. The output is now decimated back to the source rate and checked for high per-channel correlation with the original, with a cross-channel control so a channel swap couldn't pass either.
+
 ## [1.4.3] - 2026-09-10
 
 `iterate-fat-llama` run (2 cycles, early stop) verifying and completing the pydub removal introduced in 1.4.2. Coherence and spectral deviation confirmed at or above the pre-removal baseline (9.5/9.9): this run measured 9.8/9.8, with the remaining 0.1 spectral-deviation gap traced to the committed reference asset itself, not a regression.

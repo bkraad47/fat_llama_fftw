@@ -42,7 +42,7 @@ After merging, update `README.md` in place (do not touch anything else in the fi
 
    If the markers don't exist yet in `README.md`, insert this whole block (markers included) immediately after the `## Spectrogram Results` section.
 
-2. **Spectrogram image** — in the `## Spectrogram Results` section, replace the image line with `![Spectrogram Results](docs/images/spectrogram_comparison.png)`, i.e. always point at the path `audio-quality-checker` reported in `spectrogram_image`, not the old external link.
+2. **Spectrogram image** — in the `## Spectrogram Results` section, replace the image line with `[![Spectrogram Results](docs/images/spectrogram_comparison.png)](https://raw.githubusercontent.com/bkraad47/fat_llama_fftw/main/docs/images/spectrogram_comparison.png)`, i.e. always point the visible image at the path `audio-quality-checker` reported in `spectrogram_image`, wrapped as a clickable link to that same file's raw GitHub URL (matching README.md's existing image convention), not the old external link.
 
 3. If `audio-quality-checker`'s report is missing `scores` or `spectrogram_image` (e.g. it failed before reaching those steps), leave `README.md` untouched and note the gap in the relayed result instead of writing partial/placeholder scores.
 
