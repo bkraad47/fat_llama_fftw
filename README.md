@@ -1,6 +1,6 @@
 [![Fat Llama Logo](/docs/images/logo.jpg)](https://raw.githubusercontent.com/bkraad47/fat_llama_fftw/main/docs/images/logo.jpg)
 
-# Fat Llama ![build - status](https://github.com/bkraad47/fat_llama_fftw/actions/workflows/tests.yml/badge.svg) ![PyPI](https://img.shields.io/pypi/v/fat-llama-fftw?label=pypi%20package) [![PyPI - Downloads](https://img.shields.io/pypi/dm/fat-llama-fttw)](https://pypistats.org/packages/fat-llama-fttw)
+# Fat Llama ![build - status](https://github.com/bkraad47/fat_llama_fftw/actions/workflows/tests.yml/badge.svg) ![PyPI](https://img.shields.io/pypi/v/fat-llama-fftw?label=pypi%20package) [![PyPI - Downloads](https://img.shields.io/pypi/dm/fat-llama-fttw)](https://pypistats.org/packages/fat-llama-fftw)
 fat_llama is a Python package for upscaling audio files to FLAC or WAV formats using advanced audio processing techniques. It utilizes cpu-accelerated calculations to enhance audio quality by upsampling and adding missing frequencies through FFT (Fast Fourier Transform), resulting in richer and more detailed audio.
 
 ## Features
