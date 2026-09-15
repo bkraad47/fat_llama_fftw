@@ -562,7 +562,9 @@ def _local_rms_envelope(signal, block_size=2048):
 def _cap_ist_changes_to_baseline_peak(expanded_channel, ist_changes,
                                       max_rounds=20, dominant_band_ratio=0.002,
                                       safety_margin=1.2, gate_block_size=2048,
-                                      gate_steepness=10.0):
+                                      gate_steepness=10.0,
+                                      silence_floor_ratio=0.005,
+                                      silence_gate_power=6.0):
     # perform_ist_iteration's peak-relative FFT threshold keeps/boosts
     # whichever frequency dominates a block's own spectrum - for real
     # music that is usually low-frequency content, since natural audio
@@ -866,6 +868,76 @@ def _cap_ist_changes_to_baseline_peak(expanded_channel, ist_changes,
     dominant_correction = (1 - dominant_scale) * dominant_component
     gated_dominant = dominant_component - gate * dominant_correction
     candidate_result = residual_component + gated_dominant
+
+    # This cycle's fix (a genuine digital-silence lead-in, found by
+    # audio-quality-checker as a residual confined to a real track's very
+    # first frames, after the broader quiet-passage elevation above was
+    # fixed): the "helps or hurts" gate above only ever chooses between two
+    # candidates (fully shrink the dominant band, or don't) - it cannot
+    # suppress ist_changes altogether, and residual_component is never
+    # touched by it at all (by design - see the docstring above, residual
+    # is meant to be genuinely-added quiet/high-frequency detail that
+    # should survive untouched). Measured directly on input_test.mp3's own
+    # true digital-silence opening (source samples there are ~1e-13, i.e.
+    # exact silence, not just quiet): even though the existing gate
+    # correctly picks the locally-quieter of its two options there (gate
+    # lands near 0, preserving a near-cancellation between dominant and
+    # residual rather than breaking it), BOTH options still carry non-zero
+    # low-level content from perform_ist_iteration's own hard-threshold
+    # FFT ringing on a block whose real content is at/below the numerical
+    # noise floor - there is no genuine signal there for either dominant
+    # or residual to represent, so neither of the gate's two choices is
+    # actually correct; the third, correct option (suppress ist_changes
+    # entirely) is not one this gate can reach. Measured effect before this
+    # fix: a real ~1s slice of input_test.mp3 starting at its own true
+    # silence (upscale_factor=7, max_iterations=300, threshold_value=0.6 -
+    # the pinned baseline config) showed ~+3.7dB broadband RMS elevation in
+    # its first 0.02s (the exact-silence portion) relative to a no-IST
+    # interpolation-only control.
+    #
+    # The fix: a third, independent gate - silence_gate - scoped to
+    # whether there is any genuine signal here at all, measured from
+    # expanded_channel (the pre-IST interpolated baseline) itself rather
+    # than from the corrected/uncorrected candidates the gate above
+    # compares. Reuses the same _local_rms_envelope WOLA machinery
+    # (gate_block_size) to estimate expanded_channel's own local RMS
+    # relative to this channel's overall peak; silence_gate = clip(ratio /
+    # silence_floor_ratio, 0, 1) ** silence_gate_power multiplies the
+    # WHOLE candidate_result (both the dominant-band component the gate
+    # above already scoped, and residual_component, which nothing else
+    # ever touches) - suppressing ist_changes altogether specifically
+    # where the pre-IST signal itself is at/below the noise floor, leaving
+    # every other region (where there is real signal, however quiet)
+    # completely unaffected once the ratio clears the floor.
+    #
+    # silence_floor_ratio=0.005 was chosen to sit strictly below the
+    # smallest ratio the existing fade-in-onset regression fixture ever
+    # reaches (measured directly: 0.005685, constant across that fixture's
+    # entire tested onset window) - this gate saturates to 1 (no
+    # suppression at all) at or before that fixture's own quietest point,
+    # so it cannot interfere with the onset-cancellation protection the
+    # gate above exists for; it only engages measurably below that floor,
+    # a region genuine near-cancelling fade-ins in this fixture and in the
+    # "does not elevate quiet real material" regression's own 0.5-1.0s
+    # slice (measured ratio ~0.24) never reach. silence_gate_power=6
+    # (rather than a plain linear ramp) was chosen because a linear ramp
+    # at this same floor only reduced the measured lead-in elevation from
+    # +3.7dB to +2.3dB - still a real residual; a steeper power-law ramp
+    # pushes the deeply-silent samples (ratio orders of magnitude below
+    # the floor) much closer to fully suppressed while still reaching
+    # exactly 1 at the same floor value, regardless of exponent - measured
+    # directly, power=6 reduces the same lead-in window to ~+0.17dB
+    # (a >20x reduction in linear terms) with the 0.02-0.25s natural onset
+    # ramp and every other previously-measured window (0.5-1.0s quiet
+    # passage, the fade-in fixture, net-attenuation/no-elevation
+    # material) unchanged to the numerical noise floor, since none of them
+    # ever sit below the floor in the first place.
+    baseline_env = _local_rms_envelope(expanded_f32, block_size=gate_block_size)
+    baseline_ratio = baseline_env / baseline_peak
+    silence_gate = np.clip(
+        baseline_ratio / silence_floor_ratio, 0.0, 1.0
+    ).astype(np.float32) ** silence_gate_power
+    candidate_result = candidate_result * silence_gate
 
     candidate_combined_peak = np.max(np.abs(expanded_f32 + candidate_result))
     if candidate_combined_peak <= baseline_peak * safety_margin:

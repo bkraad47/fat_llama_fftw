@@ -2,7 +2,7 @@
 
 Regenerable factblock snapshot of the codebase, produced by the `review-current-state` skill. Do not hand-edit — regenerate on demand instead. Scope: whole repository (tracked files only; build/venv/cache directories excluded).
 
-Snapshot taken against candidate `v-2.0.0/iter-2` — after `iterate-fat-llama`'s cycle 2 fix, which corrected a real-audio regression cycle 1's port (frequency-selective + envelope-gated IST peak-capping, ported from the CUDA sibling repo `bkraad47/fat_llama`'s `v-2.0.0` branch) introduced into `_cap_ist_changes_to_baseline_peak`.
+Snapshot taken against candidate `v-2.0.0/iter-4` — after an `iterate-fat-llama` cycle 1 fix addressing two audio-quality-checker findings measured on the shipped v2.0.0 state: (A) a quiet-passage level elevation caused by `_cap_ist_changes_to_baseline_peak`'s envelope gate, fixed; (B) no IST-attributable added detail below the original Nyquist frequency, investigated this cycle via a new mechanism (per-band FFT thresholding) and reverted after direct measurement showed the apparent gain was uncorrelated noise, not genuine detail — remains an open, long-standing gap.
 
 ## File tree
 
@@ -88,7 +88,7 @@ write_audio('output_test.flac', 44100, upscaled_samples, 'flac')
 ### `new_interpolation_algorithm(data, upscale_factor) -> np.ndarray`
 **File:** fat_llama_fftw/audio_fattener/feed.py:126
 **Kind:** function
-**Description:** Bandlimited (FFT zero-padding / ideal-sinc) interpolation: `rfft` the channel, zero-pad its one-sided spectrum out to the upscaled length's own `rfft` size (halving the original Nyquist bin first for even-length inputs, the standard real-FFT correction), `irfft` back, and rescale by `upscale_factor` to compensate `irfft`'s larger normalization divisor. Replaces an earlier zero-order-hold (repeat-each-sample) implementation, which imaged the original spectrum above the original Nyquist frequency (measured -34.7dB relative on real material, vs. this method's -153.3dB — pure float noise) and left every downstream stage (IST's peak-relative threshold, the peak cap) operating on a signal shaped by that imaging. `upscale_factor==1` and empty input are explicit identity/passthrough short-circuits.
+**Description:** Bandlimited (FFT zero-padding / ideal-sinc) interpolation: `rfft` the channel, zero-pad its one-sided spectrum out to the upscaled length's own `rfft` size (halving the original Nyquist bin first for even-length inputs, the standard real-FFT correction), `irfft` back, and rescale by `upscale_factor` to compensate `irfft`'s larger normalization divisor. Replaces an earlier zero-order-hold (repeat-each-sample) implementation, which imaged the original spectrum above the original Nyquist frequency. `upscale_factor==1` and empty input are explicit identity/passthrough short-circuits.
 **Parameters:**
 - `data` (`np.ndarray`): 1-D channel samples.
 - `upscale_factor` (`int`): how many times to expand the sample count.
@@ -114,7 +114,7 @@ data_thres = initialize_ist(expanded_channel, threshold=0.6)
 ### `perform_ist_iteration(data_thres, threshold) -> np.ndarray`
 **File:** fat_llama_fftw/audio_fattener/feed.py:220
 **Kind:** function
-**Description:** One IST refinement pass: FFT the current estimate (`pyfftw.interfaces.numpy_fft`, cached via `pyfftw.interfaces.cache.enable()` at module load), zero out FFT bins at/below `threshold * max(abs(fft))`, **always excludes the DC bin (`mask[0] = False`)** regardless of whether it clears the threshold (an asymmetric transient can otherwise make DC the single loudest bin, injecting a spurious constant offset into every subsequent pass), then inverse-FFTs back and keeps the real part.
+**Description:** One IST refinement pass: FFT the current estimate (`pyfftw.interfaces.numpy_fft`, cached via `pyfftw.interfaces.cache.enable()` at module load), zero out FFT bins at/below `threshold * max(abs(fft))`, **always excludes the DC bin (`mask[0] = False`)** regardless of whether it clears the threshold, then inverse-FFTs back and keeps the real part. **This cycle's investigation (no code change):** a per-band (rather than whole-spectrum) peak-relative thresholding variant was implemented and measured as a direct attempt at the "no measurable added detail above ~800Hz" gap — it did raise high-frequency band energy on real material, but a direct envelope-correlation check against the lossless reference showed the gain was NOT more reference-correlated (stayed at ~0.02-0.08 regardless of band count) — i.e. noise, not detail — and it also reopened an existing block-boundary-discontinuity regression, which a safety floor fixed but only by erasing the entire measured gain. Reverted; function body unchanged from before this cycle. See the function's own extensive docstring comment for the full investigation.
 **Parameters:**
 - `data_thres` (`np.ndarray`): current time-domain estimate (one block's worth, when called via the blocked path).
 - `threshold` (`float`): fraction of the current FFT magnitude's own peak to use as the cutoff.
@@ -125,7 +125,7 @@ data_thres = perform_ist_iteration(data_thres, threshold=0.6)
 ```
 
 ### `_ist_chain(data, max_iter, threshold, convergence_tol) -> np.ndarray`
-**File:** fat_llama_fftw/audio_fattener/feed.py:254
+**File:** fat_llama_fftw/audio_fattener/feed.py:302
 **Kind:** function (private helper)
 **Description:** Runs `perform_ist_iteration` in a genuine sequential chain (each pass feeds its own output into the next) with an early exit once a pass's change falls below `convergence_tol` relative to the initial post-threshold scale — hard-threshold IST is a fixed-point projection, so passes past that point are provably no-ops. Called once for a short/whole-signal input, or once per block for the blocked path in `iterative_soft_thresholding`.
 **Parameters:**
@@ -136,9 +136,9 @@ data_thres = perform_ist_iteration(data_thres, threshold=0.6)
 **Returns:** `np.ndarray` — the converged (or `max_iter`-capped) IST estimate.
 
 ### `iterative_soft_thresholding(data, max_iter, threshold, convergence_tol=1e-6, block_size=8192) -> np.ndarray`
-**File:** fat_llama_fftw/audio_fattener/feed.py:287
+**File:** fat_llama_fftw/audio_fattener/feed.py:335
 **Kind:** function
-**Description:** For `len(data) <= block_size`, a single `_ist_chain` call over the whole array. Above `block_size`, splits the signal into 50%-overlapping **sqrt-Hann**-windowed blocks and runs `_ist_chain` independently on each (so the peak-relative threshold reflects each block's own local dynamics rather than one whole-file global peak), reconstructing via **WOLA** (weighted overlap-add — the same sqrt-Hann window applied again on the synthesis side before accumulation, weight summing `window**2`; needed because `_ist_chain`'s nonlinear FFT-threshold projection does not preserve an analysis-windowed frame's own edge taper on the way out, so synthesis-side windowing is required to keep the discontinuity out of the overlap-add sum). Each windowed block's own synthesis-side DC/near-DC leak (windowing is a convolution with the window's own spectrum, not a perfect delta at 0Hz) is removed before accumulation via a taper-preserving correction (`windowed_result - window * (sum(windowed_result) / sum(window))`, not a flat scalar subtraction, which would re-introduce edge discontinuities).
+**Description:** For `len(data) <= block_size`, a single `_ist_chain` call over the whole array. Above `block_size`, splits the signal into 50%-overlapping **sqrt-Hann**-windowed blocks and runs `_ist_chain` independently on each (so the peak-relative threshold reflects each block's own local dynamics rather than one whole-file global peak), reconstructing via **WOLA** (weighted overlap-add). Each windowed block's own synthesis-side DC/near-DC leak is removed before accumulation via a taper-preserving correction (`windowed_result - window * (sum(windowed_result) / sum(window))`).
 **Parameters:**
 - `data` (`np.ndarray`): input samples (typically the interpolated/expanded channel).
 - `max_iter` (`int`): upper bound on IST passes per block/chain.
@@ -152,30 +152,44 @@ ist_changes = iterative_soft_thresholding(expanded_channel, max_iter=300, thresh
 ```
 
 ### `_local_peak_envelope(signal, block_size=8192) -> np.ndarray`
-**File:** fat_llama_fftw/audio_fattener/feed.py:400
+**File:** fat_llama_fftw/audio_fattener/feed.py:448
 **Kind:** function (private helper)
-**Description:** **New this cycle** (ported from the CUDA sibling repo's `v-2.0.0` branch, translated cupy→numpy/pyfftw). Estimates a smooth, WOLA-based local-peak-magnitude envelope of `signal`: each `block_size`-sample analysis window's own peak (`max(abs(.))` of that windowed block) is broadcast across the block and overlap-added using the same 50%-hop sqrt-Hann window-shape and `window**2` weighting `iterative_soft_thresholding` uses for its own reconstruction — implemented as a separate, self-contained function (not a refactor of that one) so it carries zero risk to `iterative_soft_thresholding`'s already-tested WOLA/DC-leak-correction path. For `len(signal) <= block_size`, returns a constant array at the signal's own overall peak. Used by `_cap_ist_changes_to_baseline_peak` to gate its frequency-selective correction so quiet/onset regions (never responsible for a peak overshoot) receive little to none of it.
+**Description:** Smooth, WOLA-based local-peak-magnitude envelope of `signal`: each `block_size`-sample analysis window's own peak (`max(abs(.))`) is broadcast across the block and overlap-added using the same 50%-hop sqrt-Hann window-shape and `window**2` weighting `iterative_soft_thresholding` uses, implemented as a separate function so it carries zero risk to that function's own tested path. For `len(signal) <= block_size`, returns a constant array at the signal's own overall peak. **As of this cycle, used only incidentally** — `_cap_ist_changes_to_baseline_peak`'s gate now uses `_local_rms_envelope` instead (see below); this function is kept for any future peak-envelope need and still has its own direct unit tests.
 **Parameters:**
-- `signal` (`np.ndarray`): the signal to estimate an envelope for (typically `expanded_channel`, the pre-IST baseline).
+- `signal` (`np.ndarray`): the signal to estimate an envelope for.
 - `block_size` (`int`): analysis/synthesis window length in samples. Default `8192`.
 **Returns:** `np.ndarray` (`float32`), same length as `signal`, non-negative.
 **Usage:**
 ```python
 envelope = _local_peak_envelope(expanded_channel)
-gate = np.clip(envelope / np.max(np.abs(expanded_channel)), 0.0, 1.0)
 ```
 
-### `_cap_ist_changes_to_baseline_peak(expanded_channel, ist_changes, max_rounds=20, dominant_band_ratio=0.002, safety_margin=1.2, onset_gate_ratio=0.3) -> np.ndarray`
-**File:** fat_llama_fftw/audio_fattener/feed.py:453
+### `_local_rms_envelope(signal, block_size=2048) -> np.ndarray`
+**File:** fat_llama_fftw/audio_fattener/feed.py:501
 **Kind:** function (private helper)
-**Description:** Bounds how much `perform_ist_iteration`'s peak-relative boost of a channel's dominant (usually low-frequency) content is allowed to inflate the combined (interpolation + IST) signal's peak above the pre-IST baseline's own peak — an inflated peak here is not "corrected" by `upscale()`'s later autoscale/normalize stages (each a per-channel scalar, together mathematically inert on the final output), it determines how hard *every* frequency, not just what IST touched, gets divided down at final normalization. Cycle 1 (this run) rewrote this on top of the original whole-signal uniform-scalar shrink (still present as the fallback path) with two refinements ported from the CUDA sibling repo `bkraad47/fat_llama`'s `v-2.0.0` branch (pure numpy/FFT logic, no CUDA-specific mechanism): (1) **frequency-selective dominant/residual split** — `ist_changes`'s own `rfft` spectrum is split into a "dominant" component (bins `>= dominant_band_ratio` of the spectrum's own peak magnitude) and a "residual" component; only the dominant component is iteratively shrunk (the original bounded multiplicative-shrink loop, reused, scoped to this component) toward bounding the combined peak, leaving residual (e.g. genuinely-added quiet/high-frequency detail) untouched; (2) **envelope-gated correction** — the dominant-band correction is tapered by a gate derived from `_local_peak_envelope(expanded_channel)`, so a genuinely non-stationary channel's quiet onset/fade-in receives little to none of the correction. **Cycle 2 (this run) fix, `onset_gate_ratio` (new):** cycle 1's gate (`clip(envelope / baseline_peak, 0, 1)`) was measured on real audio to sit below 1.0 for ~99.6% of samples in an ordinary loud passage (real music's crest factor keeps a block's local peak well below the channel's single loudest instant almost everywhere, not just at genuine quiet/onset regions), suppressing the intended correction nearly everywhere and letting `ist_changes` retain ~24-29% of its own uncapped peak instead of the ~7-13% the original uniform-shrink cap was tuned for — measured as a +1.0 to +1.55dB low-frequency boost that the final normalize then paid for out of every other band (coherence 9.9→7.0 on real material). Fix: `gate = clip((envelope / baseline_peak) / onset_gate_ratio, 0, 1)` — saturates to `1.0` (full correction) throughout any region whose local envelope is within `onset_gate_ratio` of the channel's own peak (i.e. ordinary loud passages), while still gating down to ~0 only in genuinely quiet/onset regions well below that floor. Falls back to one additional whole-signal uniform-shrink pass (the original method, gated the same way) on top of the frequency-selective candidate only if that candidate's own combined peak still exceeds `baseline_peak * safety_margin`. `max_rounds=20`, `dominant_band_ratio=0.002`, `safety_margin=1.2` unchanged; `onset_gate_ratio=0.3` empirically chosen (cycle 2) from a real audio slice — verified in the range ~[0.05, 0.35].
+**Description:** **New this cycle.** Same WOLA machinery as `_local_peak_envelope`, but each block's own scalar is its RMS (`sqrt(mean(x**2))`) instead of its peak. Kept as a separate function for the same zero-risk-to-existing-behavior reason `_local_peak_envelope` is separate from `iterative_soft_thresholding`'s own WOLA loop. Used by `_cap_ist_changes_to_baseline_peak`'s new "does the dominant-band correction help or hurt in this local region" gate — RMS rather than peak because a peak-based version of that same gate was measured to be noisy at a quiet, oscillating signal's zero crossings, mis-classifying several hundred samples right at a fade-in's quietest point.
+**Parameters:**
+- `signal` (`np.ndarray`): the signal to estimate an RMS envelope for.
+- `block_size` (`int`): analysis/synthesis window length in samples. Default `2048`.
+**Returns:** `np.ndarray` (`float32`), same length as `signal`, non-negative.
+**Usage:**
+```python
+env = _local_rms_envelope(combined_candidate, block_size=2048)
+```
+
+### `_cap_ist_changes_to_baseline_peak(expanded_channel, ist_changes, max_rounds=20, dominant_band_ratio=0.002, safety_margin=1.2, gate_block_size=2048, gate_steepness=10.0) -> np.ndarray`
+**File:** fat_llama_fftw/audio_fattener/feed.py:562
+**Kind:** function (private helper)
+**Description:** Bounds how much `perform_ist_iteration`'s peak-relative boost of a channel's dominant content is allowed to inflate the combined (interpolation + IST) signal's peak above the pre-IST baseline's own peak — an inflated peak here is what determines how hard every frequency gets divided down at final normalization, not just what IST touched. Splits `ist_changes`'s own `rfft` spectrum into a "dominant" component (bins `>= dominant_band_ratio` of the spectrum's own peak) and a "residual" component; only the dominant component is iteratively shrunk (bounded multiplicative-shrink loop, `max_rounds`) toward bounding the combined peak, leaving residual (genuinely-added quiet/high-frequency detail) untouched. Falls back to one additional whole-signal uniform-shrink pass if the frequency-selective candidate's own combined peak still exceeds `baseline_peak * safety_margin`.
+**This cycle's fix (replaces the prior `onset_gate_ratio` mechanism, now retired):** the dominant-band correction is gated by how much it would help or hurt *locally*, not by a single global peak ratio. For each candidate, computes `_local_rms_envelope` (block size `gate_block_size`) of both the fully-uncorrected and fully-corrected combined signal; `local_ratio = env_corrected / env_uncorrected`; `gate = clip(1 - gate_steepness * (local_ratio - 1), 0, 1)` — `ratio <= 1` (correction doesn't raise local level) saturates the gate to `1` (full correction); `ratio > 1` (correction raises local level — the "unmasking" signature) ramps the gate toward `0`. Root cause this replaces: the prior `onset_gate_ratio` design (`gate = clip((envelope/baseline_peak)/onset_gate_ratio, 0, 1)`, envelope from `_local_peak_envelope`) could not distinguish "quiet because dominant/residual genuinely cancel" (a real fade-in, where correction hurts) from "quiet with real uncancelled excess" (an ordinary quiet passage, where correction helps) — both situations sit at a similarly low envelope/peak ratio on real material. Measured on real `input_test.mp3`: quiet-passage elevation (vs. a no-IST control) dropped from mean +2.0/max +2.5dB to mean +0.45/max +1.9dB, while the original synthetic fade-in regression bound (a near-exact dominant/residual cancellation case) still holds at ~0.42dB elevation (well under its 3dB bound) — i.e. the fix keeps onset protection while no longer over-applying it to ordinary quiet passages. `gate_block_size=2048` and `gate_steepness=10.0` were verified stable across a `[1024,4096] x [5,20]` neighborhood sweep.
 **Parameters:**
 - `expanded_channel` (`np.ndarray`): the pre-IST interpolated baseline for this channel.
 - `ist_changes` (`np.ndarray`): IST's contribution, as returned by `iterative_soft_thresholding`.
-- `max_rounds` (`int`): bound on shrink-loop iterations (both the dominant-band pass and the safety-net fallback). Default `20`.
+- `max_rounds` (`int`): bound on shrink-loop iterations. Default `20`.
 - `dominant_band_ratio` (`float`): fraction of the spectrum's own peak magnitude a bin must reach to be classified "dominant". Default `0.002`.
 - `safety_margin` (`float`): the safety-net fallback only engages if the frequency-selective candidate's own combined peak still exceeds `baseline_peak * safety_margin`. Default `1.2`.
-- `onset_gate_ratio` (`float`): **new this cycle.** Fraction of the channel's own peak below which the envelope gate starts tapering the dominant-band correction down; at/above it the gate saturates to `1.0` (full correction applied). Default `0.3`.
+- `gate_block_size` (`int`): **new this cycle** (replaces `onset_gate_ratio`). WOLA block size for the local-RMS "helps or hurts" gate. Default `2048`.
+- `gate_steepness` (`float`): **new this cycle.** How sharply the gate ramps from `1` to `0` as `local_ratio` exceeds `1`. Default `10.0`.
 **Returns:** `np.ndarray` — `ist_changes`, reshaped/rescaled per the above (unchanged if no capping was needed).
 **Usage:**
 ```python
@@ -183,7 +197,7 @@ capped = _cap_ist_changes_to_baseline_peak(expanded_channel, ist_changes)
 ```
 
 ### `_process_channel(channel, upscale_factor, max_iter, threshold) -> np.ndarray`
-**File:** fat_llama_fftw/audio_fattener/feed.py:659
+**File:** fat_llama_fftw/audio_fattener/feed.py:895
 **Kind:** function (private helper)
 **Description:** The full per-channel pipeline — interpolate (`new_interpolation_algorithm`) → IST (`iterative_soft_thresholding`) → peak-cap (`_cap_ist_changes_to_baseline_peak`) → combine — factored out so `upscale_channels` can dispatch it either sequentially or on a worker thread. Reads/writes only its own `channel` argument (no shared state), so channels are provably safe to run concurrently.
 **Parameters:**
@@ -192,9 +206,9 @@ capped = _cap_ist_changes_to_baseline_peak(expanded_channel, ist_changes)
 **Returns:** `np.ndarray` (`float32`) — this channel's fully processed (interpolated + IST + capped) samples.
 
 ### `upscale_channels(channels, upscale_factor, max_iter, threshold) -> np.ndarray`
-**File:** fat_llama_fftw/audio_fattener/feed.py:675
+**File:** fat_llama_fftw/audio_fattener/feed.py:911
 **Kind:** function
-**Description:** Runs `_process_channel` per channel and stacks the results back into a single 2-D array. For multi-channel (e.g. stereo) input, dispatches each channel's independent work across a `ThreadPoolExecutor` (numpy/pyfftw release the GIL during vectorized FFT work) instead of a sequential loop — measured 1.24x wall-clock speedup on real stereo `input_test.mp3`, verified bit-identical output. Mono input skips the thread pool (no benefit for one unit of work).
+**Description:** Runs `_process_channel` per channel and stacks the results back into a single 2-D array. For multi-channel (e.g. stereo) input, dispatches each channel's independent work across a `ThreadPoolExecutor` instead of a sequential loop. Mono input skips the thread pool.
 **Parameters:**
 - `channels` (`np.ndarray`): shape `(n_samples, n_channels)`.
 - `upscale_factor` (`int`): passed to `new_interpolation_algorithm`.
@@ -207,7 +221,7 @@ upscaled = upscale_channels(channels, upscale_factor=4, max_iter=300, threshold=
 ```
 
 ### `normalize_signal(signal) -> np.ndarray`
-**File:** fat_llama_fftw/audio_fattener/feed.py:720
+**File:** fat_llama_fftw/audio_fattener/feed.py:956
 **Kind:** function
 **Description:** Peak-normalizes a signal to `[-1, 1]` by dividing by its max absolute value.
 **Parameters:**
@@ -219,9 +233,9 @@ normalized = normalize_signal(channel)
 ```
 
 ### `apply_nyquist_cutoff(signal, sample_rate, original_nyquist) -> np.ndarray`
-**File:** fat_llama_fftw/audio_fattener/feed.py:724
+**File:** fat_llama_fftw/audio_fattener/feed.py:960
 **Kind:** function
-**Description:** Zeroes every FFT bin above `original_nyquist` (via `pyfftw` `rfft`/`irfft`, multi-threaded per `_fft_thread_count` for large signals), enforcing `.claude/rules/project-mission.md`'s hard "no content above the original Nyquist frequency" constraint. Runs after amplitude auto-scaling but *before* `upscale()`'s final `normalize_signal` pass — a brick-wall FFT filter can overshoot its own input's peak (Gibbs ripple), so normalizing after the cutoff guarantees the written signal never exceeds full scale.
+**Description:** Zeroes every FFT bin above `original_nyquist` (via `pyfftw` `rfft`/`irfft`, multi-threaded per `_fft_thread_count` for large signals), enforcing `.claude/rules/project-mission.md`'s hard "no content above the original Nyquist frequency" constraint. Runs after amplitude auto-scaling but *before* `upscale()`'s final `normalize_signal` pass.
 **Parameters:**
 - `signal` (`np.ndarray`): 1-D channel samples at the *upscaled* sample rate.
 - `sample_rate` (`int`): the upscaled signal's own sample rate.
@@ -233,15 +247,15 @@ filtered = apply_nyquist_cutoff(upscaled_channel, new_sample_rate, original_samp
 ```
 
 ### `upscale(input_file_path, output_file_path, source_format, target_format='flac', max_iterations=800, threshold_value=0.6, target_bitrate_kbps=1411) -> None`
-**File:** fat_llama_fftw/audio_fattener/feed.py:750
+**File:** fat_llama_fftw/audio_fattener/feed.py:986
 **Kind:** function
-**Description:** The package's public entry point (README's documented API). Reads the source file, computes an `upscale_factor` from `target_bitrate_kbps` vs. the source's own bitrate (`round(target_bitrate / bitrate)`, floored at `1` so a source whose own bitrate already exceeds the target — e.g. a lossless WAV/FLAC source — never rounds to 0/crashes, just skips the sample-rate increase), runs `upscale_channels` per channel, auto-scales each channel back to its original peak, runs `apply_nyquist_cutoff`, and finally normalizes (in that order — normalization strictly last so the cutoff's own Gibbs overshoot can't push samples above full scale on write). No `toggle_*` flags exist on this signature — auto-scaling, the Nyquist cutoff, and normalization always run unconditionally.
+**Description:** The package's public entry point (README's documented API). Reads the source file, computes an `upscale_factor` from `target_bitrate_kbps` vs. the source's own bitrate (floored at `1`), runs `upscale_channels` per channel, auto-scales each channel back to its original peak, runs `apply_nyquist_cutoff`, and finally normalizes (normalization strictly last so the cutoff's own Gibbs overshoot can't push samples above full scale on write). No `toggle_*` flags exist on this signature — auto-scaling, the Nyquist cutoff, and normalization always run unconditionally. Unchanged this cycle.
 **Parameters:**
 - `input_file_path` (`str`): source audio file path.
 - `output_file_path` (`str`): destination file path.
 - `source_format` (`str`): `'mp3'`, `'wav'`, `'ogg'`, or `'flac'`.
 - `target_format` (`str`): `'flac'` or `'wav'`. Default `'flac'`.
-- `max_iterations` (`int`): IST iteration upper bound (see `iterative_soft_thresholding`'s early-exit behavior). Default `800`.
+- `max_iterations` (`int`): IST iteration upper bound. Default `800`.
 - `threshold_value` (`float`): IST threshold. Default `0.6`.
 - `target_bitrate_kbps` (`int`): target bitrate; validated against a per-format range (`flac`: 800-1411, `wav`: 800-6444). Default `1411`.
 **Returns:** `None` (writes the output file as a side effect).
@@ -266,70 +280,58 @@ upscale(
 ### `TestFeed`
 **File:** fat_llama_fftw/tests/test_feed.py:35
 **Kind:** class
-**Description:** `unittest.TestCase` covering every function in `feed.py`, 50 test methods as of this cycle. Notable groups: I/O (`read_audio`/`write_audio`, including a real on-disk roundtrip test), interpolation (bandlimited-ness, identity/passthrough edge cases, no-imaging-above-Nyquist), IST core (thresholding, chaining, convergence early-exit, DC-bin exclusion, WOLA block/no-discontinuity behavior, scale-invariance), `_local_peak_envelope` (3 direct unit tests, new cycle 2), the peak cap (`_cap_ist_changes_to_baseline_peak` — 6 tests, see below), 2 strengthened net-attenuation tests (now also bound a low-frequency *boost*, cycle 2), the Nyquist cutoff (removal + multi-threading), and full `upscale()` wiring/edge cases (bitrate clamping, never-exceeds-full-scale, a real end-to-end on-disk FLAC write).
+**Description:** `unittest.TestCase` covering every function in `feed.py`, 55 test methods as of this cycle (50 prior + 5 new: 4 for `_local_rms_envelope`, 1 real-material quiet-passage regression test). Notable groups: I/O, interpolation, IST core, `_local_peak_envelope` (3 tests), `_local_rms_envelope` (4 tests, new), the peak cap (`_cap_ist_changes_to_baseline_peak` — 7 tests), 2 net-attenuation/boost-bound tests, the Nyquist cutoff, and full `upscale()` wiring/edge cases.
 **Usage:**
 ```python
 python -m unittest discover -s fat_llama_fftw/tests
 ```
 
-### `TestFeed.test_cap_ist_changes_to_baseline_peak_noop_when_not_needed(self)`
-**File:** fat_llama_fftw/tests/test_feed.py:508
-**Kind:** method
-**Description:** Asserts the cap leaves `ist_changes` unmodified when the combined peak never exceeds the baseline (zero baseline peak, or an out-of-phase addition that can only reduce the combined amplitude).
-**Returns:** `None` (assertion-based).
+### `TestFeed.test_local_rms_envelope_empty_signal(self)` / `test_local_rms_envelope_short_signal_returns_constant_rms(self)` / `test_local_rms_envelope_tracks_loud_and_quiet_regions(self)` / `test_local_rms_envelope_differs_from_peak_envelope_on_bursty_signal(self)`
+**File:** fat_llama_fftw/tests/test_feed.py:561, 571, 580, 610
+**Kind:** method (4 tests)
+**Description:** **New this cycle.** Direct unit coverage for `_local_rms_envelope`: empty-signal edge case, short-signal constant-RMS passthrough, tracking distinct loud/quiet regions, and a direct RMS-vs-peak disagreement test (a brief loud burst inside an otherwise-silent block: peak envelope is dominated by the burst, RMS envelope stays low) proving the two are not interchangeable proxies.
+**Returns:** `None` (assertion-based, each).
 
-### `TestFeed.test_cap_ist_changes_to_baseline_peak_bounds_combined_peak(self)`
-**File:** fat_llama_fftw/tests/test_feed.py:519
-**Kind:** method
-**Description:** Regression test for the original attenuation fix: on an in-phase-dominant synthetic signal, asserts the cap meaningfully reduces the combined-peak overshoot without collapsing `ist_changes` to (near) zero.
-**Returns:** `None` (assertion-based).
-
-### `TestFeed.test_cap_ist_changes_to_baseline_peak_preserves_quiet_band(self)`
-**File:** fat_llama_fftw/tests/test_feed.py:567
-**Kind:** method
-**Description:** **New this cycle.** Loud-low/quiet-high two-tone fixture: asserts the quiet high-frequency band's own FFT magnitude survives the (new, frequency-selective) cap at >90% of its uncapped value, while the combined peak is still bounded close to baseline — the direct regression test for the frequency-selective dominant/residual split (the old uniform shrink left this band at ~4% survival).
-**Returns:** `None` (assertion-based).
-
-### `TestFeed.test_cap_ist_changes_to_baseline_peak_pathological_ratio_falls_back(self)`
-**File:** fat_llama_fftw/tests/test_feed.py:622
-**Kind:** method
-**Description:** **New this cycle.** A `dominant_band_ratio` high enough that nothing classifies as dominant; asserts the safety-net whole-signal uniform-shrink fallback still bounds the combined peak at least as well as the pre-existing (pre-cycle) cap did.
-**Returns:** `None` (assertion-based).
-
-### `TestFeed.test_cap_ist_changes_to_baseline_peak_zero_baseline(self)`
-**File:** fat_llama_fftw/tests/test_feed.py:645
-**Kind:** method
-**Description:** Asserts the cap returns `ist_changes` unchanged when `expanded_channel` is silent (nothing to cap against).
-**Returns:** `None` (assertion-based).
+### `TestFeed.test_cap_ist_changes_to_baseline_peak_noop_when_not_needed(self)` / `..._bounds_combined_peak(self)` / `..._preserves_quiet_band(self)` / `..._pathological_ratio_falls_back(self)` / `..._zero_baseline(self)`
+**File:** fat_llama_fftw/tests/test_feed.py:627, 638, 686, 741, 764
+**Kind:** method (5 tests, unchanged this cycle)
+**Description:** No-op/zero-baseline short-circuits, the original attenuation-fix regression bound, the frequency-selective dominant/residual split's quiet-band-survival guard, and the pathological-`dominant_band_ratio` safety-net fallback. All still pass unmodified against this cycle's gate redesign (the gate only affects the dominant-band correction's own magnitude, not whether the split/shrink-loop mechanics engage).
+**Returns:** `None` (assertion-based, each).
 
 ### `TestFeed.test_cap_ist_changes_to_baseline_peak_envelope_gates_quiet_onset(self)`
-**File:** fat_llama_fftw/tests/test_feed.py:654
+**File:** fat_llama_fftw/tests/test_feed.py:773
 **Kind:** method
-**Description:** Broadband, raised-cosine fade-in synthetic channel run through the real `new_interpolation_algorithm` → `iterative_soft_thresholding` → `_cap_ist_changes_to_baseline_peak` pipeline; asserts the onset window's post-cap RMS elevation vs. the pre-IST interpolation baseline stays under a small bound — the direct regression test for `_local_peak_envelope`'s gating. Re-verified this cycle (2) against the `onset_gate_ratio` fix: still passes (~0.03dB elevation, well under bound), confirming the fix didn't regress onset protection while fixing the real-material over-suppression bug.
+**Description:** Broadband, raised-cosine fade-in synthetic channel run through the real pipeline; asserts onset-window RMS elevation vs. the pre-IST baseline stays under 3dB — the regression guard for genuine near-cancelling-onset protection. **Re-verified this cycle** against the new local-RMS-envelope gate (replacing `onset_gate_ratio`): still passes, now measuring ~0.42dB elevation (vs. the old design's ~0.1dB — still a large margin under the 3dB bound, not a regression of the protection itself).
+**Returns:** `None` (assertion-based).
+
+### `TestFeed.test_cap_ist_changes_to_baseline_peak_does_not_elevate_quiet_real_material(self)`
+**File:** fat_llama_fftw/tests/test_feed.py:848
+**Kind:** method
+**Description:** **New this cycle.** Direct regression test for the audio-quality-checker finding this cycle fixed: a real ~1s slice of `input_test.mp3`'s own quiet opening, run through the real pipeline at the pinned baseline config, must not show more than 1.5dB broadband RMS elevation vs. a no-IST interpolation-only control. The OLD (`onset_gate_ratio`) design measured ~+2.3 to +2.4dB there (would fail); the NEW (local-RMS-envelope) design measures ~+0.24 to +0.29dB (passes with margin).
 **Returns:** `None` (assertion-based).
 
 ### `TestFeed.test_upscale_channels_caps_combined_peak_close_to_baseline_stereo(self)`
-**File:** fat_llama_fftw/tests/test_feed.py:718
+**File:** fat_llama_fftw/tests/test_feed.py
 **Kind:** method
-**Description:** End-to-end (stereo, 2 distinct-content channels) wiring check that `upscale_channels` itself — not just the cap helper in isolation — keeps each channel's combined peak close to its own pre-IST interpolation baseline.
+**Description:** End-to-end (stereo, 2 distinct-content channels) wiring check that `upscale_channels` itself keeps each channel's combined peak close to its own pre-IST interpolation baseline. Unchanged this cycle.
 **Returns:** `None` (assertion-based).
 
 ### `TestFeed.test_local_peak_envelope_empty_signal(self)` / `test_local_peak_envelope_short_signal_returns_constant_peak(self)` / `test_local_peak_envelope_tracks_loud_and_quiet_regions(self)`
-**File:** fat_llama_fftw/tests/test_feed.py:508, 520, 530
-**Kind:** method (3 tests)
-**Description:** **New this cycle (2).** Direct unit coverage for `_local_peak_envelope`, closing a gap `audio-quality-checker` found (the function was imported in cycle 1 but never referenced by any test): empty-signal edge case, short-signal (`<= block_size`) constant-peak passthrough, and that the envelope actually tracks distinct loud vs. quiet regions of a synthetic signal.
+**File:** fat_llama_fftw/tests/test_feed.py
+**Kind:** method (3 tests, unchanged this cycle)
+**Description:** Direct unit coverage for `_local_peak_envelope` (still used elsewhere/kept for future use, though `_cap_ist_changes_to_baseline_peak`'s own gate now uses `_local_rms_envelope` instead): empty-signal edge case, short-signal constant-peak passthrough, tracking loud vs. quiet regions.
 **Returns:** `None` (assertion-based, each).
 
 ### `TestFeed.test_upscale_channels_ist_does_not_net_attenuate_untouched_band(self)` / `test_upscale_channels_ist_does_not_net_attenuate_real_material(self)`
-**File:** fat_llama_fftw/tests/test_feed.py:809, 906
-**Kind:** method (2 tests, strengthened this cycle)
-**Description:** Pre-existing net-attenuation regression tests, extended this cycle (2) with a symmetric low-frequency/low-band **boost** bound (`assertLess(lf_ratio_db, 1.0)` / a new 20-300Hz `assertLess(lb_ratio_db, 0.5)` check) calibrated against the actual cycle-1-regression measurement, so a future recurrence of the "onset_gate_ratio"-class bug (excess low-frequency content surviving the peak cap) fails the unit suite directly instead of requiring a full `audio-quality-checker` real-material run to catch it.
+**File:** fat_llama_fftw/tests/test_feed.py
+**Kind:** method (2 tests, unchanged this cycle)
+**Description:** Net-attenuation regression tests with a symmetric low-frequency/low-band boost bound (from the prior cycle's `onset_gate_ratio` regression). Still pass against this cycle's gate redesign.
 **Returns:** `None` (assertion-based, each).
 
-### Other test methods (unchanged since cycle 1)
+### Other test methods (unchanged since prior cycles)
 **File:** fat_llama_fftw/tests/test_feed.py
 **Kind:** method (39 additional tests)
-**Description:** `test_read_audio`, `test_read_audio_unsupported_format_computes_bitrate_from_duration`, `test_read_audio_does_not_corrupt_channel_counts_above_stereo`, `test_write_audio`, `test_write_audio_wav_uses_wav_container`, `test_write_audio_rejects_unsupported_format`, `test_write_audio_roundtrip_preserves_audio_properties_on_disk`, `test_new_interpolation_algorithm(_identity_at_upscale_factor_one|_odd_length_passthrough|_no_imaging_above_original_nyquist)`, `test_initialize_ist(_scales_with_data_magnitude|_zero_signal_stays_zero)`, `test_upscale_channels(_thresholded_out_is_pure_interpolation|_parallel_matches_sequential_per_channel|_mono_skips_thread_pool)`, `test_iterative_soft_thresholding_chains_across_iterations`, `test_iterative_soft_thresholding_stops_early_once_converged`, `test_ist_adds_content_distinct_from_input_at_realistic_scale`, `test_ist_pipeline_is_scale_invariant_within_float32_precision`, `test_perform_ist_iteration_never_keeps_dc_bin`, `test_iterative_soft_thresholding_output_has_no_dc_offset`, `test_ist_no_dc_offset_on_real_programme_material`, `test_iterative_soft_thresholding_blocks_restore_multiple_bands`, `test_iterative_soft_thresholding_no_block_boundary_discontinuity`, `test_feed_block_boundary_test_fixture_is_representative`, `test_no_block_hop_boundary_curvature_bump`, `test_apply_nyquist_cutoff_removes_image_content`, `test_fft_thread_count_scoped_to_large_transforms`, `test_apply_nyquist_cutoff_requests_multiple_threads_for_large_signal`, `test_upscale_wires_apply_nyquist_cutoff`, `test_upscale_clamps_upscale_factor_to_one_for_high_bitrate_source`, `test_upscale_factor_one_from_moderately_high_bitrate_source_no_warning`, `test_upscale_output_never_exceeds_full_scale`, `test_upscale_writes_valid_flac_end_to_end_on_disk`, `test_normalize_signal`. All still pass against cycle 2's `onset_gate_ratio` fix.
+**Description:** `test_read_audio`, `test_read_audio_unsupported_format_computes_bitrate_from_duration`, `test_read_audio_does_not_corrupt_channel_counts_above_stereo`, `test_write_audio`, `test_write_audio_wav_uses_wav_container`, `test_write_audio_rejects_unsupported_format`, `test_write_audio_roundtrip_preserves_audio_properties_on_disk`, `test_new_interpolation_algorithm(_identity_at_upscale_factor_one|_odd_length_passthrough|_no_imaging_above_original_nyquist)`, `test_initialize_ist(_scales_with_data_magnitude|_zero_signal_stays_zero)`, `test_upscale_channels(_thresholded_out_is_pure_interpolation|_parallel_matches_sequential_per_channel|_mono_skips_thread_pool)`, `test_iterative_soft_thresholding_chains_across_iterations`, `test_iterative_soft_thresholding_stops_early_once_converged`, `test_ist_adds_content_distinct_from_input_at_realistic_scale`, `test_ist_pipeline_is_scale_invariant_within_float32_precision`, `test_perform_ist_iteration_never_keeps_dc_bin`, `test_iterative_soft_thresholding_output_has_no_dc_offset`, `test_ist_no_dc_offset_on_real_programme_material`, `test_iterative_soft_thresholding_blocks_restore_multiple_bands`, `test_iterative_soft_thresholding_no_block_boundary_discontinuity`, `test_feed_block_boundary_test_fixture_is_representative`, `test_no_block_hop_boundary_curvature_bump`, `test_apply_nyquist_cutoff_removes_image_content`, `test_fft_thread_count_scoped_to_large_transforms`, `test_apply_nyquist_cutoff_requests_multiple_threads_for_large_signal`, `test_upscale_wires_apply_nyquist_cutoff`, `test_upscale_clamps_upscale_factor_to_one_for_high_bitrate_source`, `test_upscale_factor_one_from_moderately_high_bitrate_source_no_warning`, `test_upscale_output_never_exceeds_full_scale`, `test_upscale_writes_valid_flac_end_to_end_on_disk`, `test_normalize_signal`. All still pass against this cycle's changes.
 **Returns:** `None` (assertion-based, each).
 
 ## example.py
@@ -337,7 +339,7 @@ python -m unittest discover -s fat_llama_fftw/tests
 ### Module-level script
 **File:** example.py:1
 **Kind:** script (no functions/classes)
-**Description:** The README-documented usage example — calls `upscale()` once against the repo-root `input_test.mp3` → `output_test.flac` with `max_iterations=600, threshold_value=0.75, target_bitrate_kbps=1400`. Not affected by this cycle's `_cap_ist_changes_to_baseline_peak` change since `upscale()`'s own public signature gained no new parameters (the new `dominant_band_ratio`/`safety_margin` kwargs are internal to the capping helper, not exposed here).
+**Description:** The README-documented usage example — calls `upscale()` once against the repo-root `input_test.mp3` → `output_test.flac` with `max_iterations=600, threshold_value=0.75, target_bitrate_kbps=1400`. A comment (added when v2.0.0 shipped) notes the IST peak-cap's behavior changed internally; `upscale()`'s own public signature has gained no new parameters across any of these cycles.
 **Usage:**
 ```python
 python example.py
@@ -396,10 +398,9 @@ compare_signals(mp3, flac, sr1)
 
 ## Open items / observations
 
-- **This run's port (iterate-fat-llama, DIRECTIVES: bring over `bkraad47/fat_llama`'s `v-2.0.0` non-CUDA changes):** compared that sibling repo's `v-2.0.0` branch against its own `main` — only `feed.py`/`test_feed.py` (plus changelog/readme/version) differed. This repo was already at parity or ahead on peak-relative thresholding, DC-bin exclusion, convergence early-exit, and WOLA blocking (this repo's own WOLA has a DC-leak correction the sibling's does not). The one real gap — `_cap_ist_changes_to_baseline_peak`'s frequency-selective + envelope-gated refinement — was ported in cycle 1. Did not port the sibling's separately-investigated-and-rejected `threshold_value=0.15` experiment (their own changelog logged it as "investigated, no change made").
-- **Cycle 1→2 regression, now fixed:** cycle 1's straight port introduced a real regression measurable only on real (non-synthetic) audio — `audio-quality-checker` measured coherence 9.9→7.0 and spectral_deviation 9.8→9.2 at the pinned baseline config. Root cause: the envelope gate (cycle 1) was scaled against the channel's single global peak, so it suppressed the frequency-selective correction almost everywhere in an ordinary loud passage, not just at genuine quiet onsets — a crest-factor effect the synthetic fixtures used to write cycle 1's own unit tests didn't exercise. Cycle 2 added `onset_gate_ratio=0.3` (see factblock) to fix this, verified directly on a real audio slice. This is a concrete illustration of why `audio-quality-checker`'s real-material measurement is load-bearing, not redundant with the unit suite.
-- **Environment hygiene finding (informational, not a source bug):** `audio-quality-checker` found a stale `fat_llama_fftw` 1.0.4 pip-installed into `venv/Lib/site-packages`, which silently shadows the repo source for any script run from outside the repo root (`python <script>` puts the script's own directory, not the repo root, at `sys.path[0]`). Not fixed this run (out of any skill's write scope) — flagged so a human or a future permitted step can `pip uninstall`/reinstall in editable mode.
-- **Still open, flagged by `generate-code` (out of its `fat_llama_fftw/**` write scope):** README.md's Algorithm Explanation (step 4) still describes the peak cap as a flat rescale, with no mention of the new frequency-selective/envelope-gated refinement — needs a human or a permitted direct edit to reconcile, same recurring gap prior cycles have flagged for other algorithm changes.
-- **Still open, out of scope for any skill/agent to edit directly:** `upscale()`'s actual signature has no `toggle_normalize`/`toggle_autoscale`/`toggle_adaptive_filter` flags and `feed.py` has no `lms_filter` function — `.claude/agents/rules/audio-quality.md`'s pinned baseline config and runtime-estimate section reference these anyway (apparently carried over from the CUDA sibling package's more elaborate `feed.py`). Needs a human or a future permitted `.claude/` edit to reconcile.
-- **Still open, methodology/human decision, not a source bug:** the repo-root reference asset `input_test.flac` is itself a stale output of this same pipeline from before the original Nyquist-cutoff fix, so it still carries above-Nyquist imaging — `audio-quality-checker`'s spectral-deviation score partly measures agreement with this defective reference rather than fidelity to an independent lossless master.
+- **This cycle's two directed fixes:** (A) `_cap_ist_changes_to_baseline_peak`'s envelope gate now decides "apply the dominant-band correction here or not" from a direct local-RMS-based "does it help or hurt" measurement (`_local_rms_envelope`, new) instead of inferring it from a single global peak ratio (`onset_gate_ratio`, retired) — fixes a measured +2.0 to +2.5dB quiet-passage elevation on real material while keeping the original fade-in-onset protection intact. (B) investigated genuine IST-attributable added detail below the original Nyquist frequency via a new mechanism (per-band rather than whole-block FFT thresholding in `perform_ist_iteration`) — measured the apparent gain was uncorrelated noise (not genuine reference-correlated detail) and reopened an existing regression; reverted, no source change. This independently reproduces, via a different mechanism, a prior cycle's own conclusion that a purely peak-relative/hard-threshold operation cannot recover detail a lossy source has already destroyed without synthesizing content (out of scope per `project-mission.md`).
+- **Still open (per DIRECTIVES, explicitly out of scope for any skill/agent):** `.claude/agents/rules/audio-quality.md`'s pinned baseline config still references `toggle_normalize`/`toggle_autoscale`/`toggle_adaptive_filter` kwargs and an `lms_filter`/~20-minute runtime estimate that don't match this package's actual `upscale()` signature or current (~3 second) runtime. This file is under `.claude/`, a hard exclusion — "edited by a human, never by a running skill or agent" — so no automated run can fix it; needs a direct human edit.
+- **Environment hygiene finding (informational, not a source bug, repeatedly re-flagged):** a stale `fat_llama_fftw` 1.0.4 is pip-installed into `venv/Lib/site-packages`, shadowing the repo source for any script run from outside the repo root. Not fixed (out of any skill's write scope) — a human should `pip uninstall`/reinstall in editable mode.
+- **Still open, flagged by prior cycles (out of `fat_llama_fftw/**` write scope):** README.md's Algorithm Explanation still describes the peak cap in terms that predate the frequency-selective/envelope-gated refinement and this cycle's gate redesign — needs a human or a permitted direct edit to reconcile.
+- **Still open, methodology/human decision, not a source bug:** the repo-root reference asset `input_test.flac` is itself a stale output of this same pipeline from before the original Nyquist-cutoff fix, so it still carries above-Nyquist imaging — spectral-deviation scoring against it partly measures agreement with this defective reference rather than fidelity to an independent lossless master.
 - `upscale()` end-to-end coverage exists (`test_upscale_wires_apply_nyquist_cutoff`, `test_upscale_writes_valid_flac_end_to_end_on_disk`) including a real on-disk write/readback test.

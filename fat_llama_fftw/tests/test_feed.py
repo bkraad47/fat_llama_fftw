@@ -847,60 +847,98 @@ class TestFeed(unittest.TestCase):
 
     def test_cap_ist_changes_to_baseline_peak_does_not_elevate_quiet_real_material(
             self):
-        # New this cycle - direct regression test for audio-quality-
-        # checker's finding: onset_gate_ratio's fixed global-peak-relative
-        # gate withheld the dominant-band correction not just at genuine
-        # near-cancelling onsets (the synthetic fixture above) but at ANY
-        # region whose local envelope sat below its floor relative to the
-        # channel's own peak - including ordinary quiet real-material
-        # passages with no cancellation to protect, leaving them elevated
-        # relative to a no-IST control. Uses a real ~1s slice of
-        # input_test.mp3 starting at its own quiet opening (not the
-        # synthetic fixture's engineered near-cancellation), run through
-        # the real new_interpolation_algorithm -> iterative_soft_
-        # thresholding -> _cap_ist_changes_to_baseline_peak pipeline at the
-        # pinned baseline config (upscale_factor=7, max_iterations=300,
-        # threshold_value=0.6). Measured directly: the OLD (onset_gate_
-        # ratio) design left this window ~+2.3 to +2.4dB elevated
-        # (broadband RMS) relative to a no-IST interpolation-only control;
-        # the NEW (local RMS-envelope helps-or-hurts) design measures
-        # ~+0.24 to +0.29dB there - comfortably under the bound below,
-        # while the old design would fail it.
+        # Direct regression test for audio-quality-checker's real-material
+        # quiet-passage findings. Uses the real new_interpolation_algorithm
+        # -> iterative_soft_thresholding -> _cap_ist_changes_to_baseline_peak
+        # pipeline at the pinned baseline config (upscale_factor=7,
+        # max_iterations=300, threshold_value=0.6) against real slices of
+        # input_test.mp3, and checks broadband RMS elevation relative to a
+        # no-IST interpolation-only control stays under a bound. Two cases,
+        # covering two different findings against two different regions of
+        # the same file (see each case's own comment below) - both must be
+        # processed as part of a properly long, block-WOLA-processed slice
+        # (not in isolation) since both findings are about how the pipeline
+        # behaves at specific points within a longer signal, not about a
+        # short clip's own edge effects.
         if not os.path.exists(_INPUT_TEST_MP3):
             self.skipTest("input_test.mp3 reference asset not present")
 
         sample_rate, samples, bitrate = read_audio(_INPUT_TEST_MP3,
                                                            format='mp3')
         channel = samples[:, 0].astype(np.float32)
-        start = int(0.5 * sample_rate)
-        n = int(0.5 * sample_rate)
-        self.assertLessEqual(start + n, len(channel),
-                             "input_test.mp3 shorter than expected - "
-                             "re-pick the slice window")
-        sig = channel[start:start + n]
-
         upscale_factor = 7
         max_iter = 300
         threshold = 0.6
+        out_sr = sample_rate * upscale_factor
 
-        expanded = new_interpolation_algorithm(sig, upscale_factor)
-        ist_changes = iterative_soft_thresholding(expanded, max_iter,
-                                                  threshold)
-        capped = _cap_ist_changes_to_baseline_peak(expanded, ist_changes)
-        combined = expanded.astype(np.float32) + capped
+        cases = [
+            # Original cycle-1 finding: onset_gate_ratio's fixed global-
+            # peak-relative gate withheld the dominant-band correction not
+            # just at genuine near-cancelling onsets (the synthetic fixture
+            # above) but at ANY region whose local envelope sat below its
+            # floor relative to the channel's own peak - including ordinary
+            # quiet real-material passages with no cancellation to protect,
+            # leaving them elevated relative to a no-IST control. Measured
+            # directly: the OLD (onset_gate_ratio) design left this window
+            # ~+2.3 to +2.4dB elevated; the NEW (local RMS-envelope helps-
+            # or-hurts) design measures ~+0.24 to +0.29dB there.
+            dict(label="ordinary quiet passage (0.5-1.0s)",
+                 proc_start=0.5, proc_len=0.5,
+                 measure_start=0.0, measure_end=0.5,
+                 bound_db=1.5),
+            # This cycle's finding (audio-quality-checker, after the fix
+            # above shipped): a residual elevation confined to the track's
+            # very first frames - its genuine digital-silence lead-in
+            # (source samples there measure ~1e-13, effectively exact
+            # silence, confirmed by direct inspection - not just quiet).
+            # Processes a slice starting at the true beginning of the file
+            # (so the WOLA-blocked pipeline sees a real "start of signal"
+            # boundary, not an isolated short clip) but measures elevation
+            # only within the first 0.02s of the OUTPUT - the exact-silence
+            # portion where the residual actually concentrates (see
+            # _cap_ist_changes_to_baseline_peak's own silence_gate comment
+            # for the direct measurement this bound is based on: ~+3.7dB
+            # before that fix, ~+0.17dB after).
+            dict(label="genuine digital-silence lead-in (0.0-0.02s)",
+                 proc_start=0.0, proc_len=0.5,
+                 measure_start=0.0, measure_end=0.02,
+                 bound_db=1.0),
+        ]
 
-        baseline_rms = float(np.sqrt(np.mean(expanded.astype(np.float64) ** 2)))
-        combined_rms = float(np.sqrt(np.mean(combined.astype(np.float64) ** 2)))
-        self.assertGreater(baseline_rms, 0,
-                           "fixture slice must not be silent")
+        for case in cases:
+            with self.subTest(case["label"]):
+                start = int(case["proc_start"] * sample_rate)
+                n = int(case["proc_len"] * sample_rate)
+                self.assertLessEqual(
+                    start + n, len(channel),
+                    "input_test.mp3 shorter than expected - re-pick the "
+                    "slice window")
+                sig = channel[start:start + n]
 
-        elevation_db = 20 * np.log10(combined_rms / baseline_rms)
-        self.assertLess(
-            elevation_db, 1.5,
-            "a genuinely quiet real-material passage should not be "
-            "measurably elevated relative to a no-IST/interpolation-only "
-            "baseline - the dominant-band correction must actually apply "
-            "there when it is not protecting a genuine cancellation")
+                expanded = new_interpolation_algorithm(sig, upscale_factor)
+                ist_changes = iterative_soft_thresholding(
+                    expanded, max_iter, threshold)
+                capped = _cap_ist_changes_to_baseline_peak(
+                    expanded, ist_changes)
+                combined = expanded.astype(np.float32) + capped
+
+                m0 = int(case["measure_start"] * out_sr)
+                m1 = int(case["measure_end"] * out_sr)
+                expanded_slice = expanded[m0:m1].astype(np.float64)
+                combined_slice = combined[m0:m1].astype(np.float64)
+
+                baseline_rms = float(np.sqrt(np.mean(expanded_slice ** 2)))
+                combined_rms = float(np.sqrt(np.mean(combined_slice ** 2)))
+                self.assertGreater(baseline_rms, 0,
+                                   "fixture measurement window must not be "
+                                   "silent in the interpolation baseline "
+                                   "itself")
+
+                elevation_db = 20 * np.log10(combined_rms / baseline_rms)
+                self.assertLess(
+                    elevation_db, case["bound_db"],
+                    f"{case['label']} should not be measurably elevated "
+                    "relative to a no-IST/interpolation-only baseline")
 
     def test_upscale_channels_caps_combined_peak_close_to_baseline_stereo(
             self):
