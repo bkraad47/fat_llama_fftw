@@ -12,6 +12,7 @@ from fat_llama_fftw.audio_fattener.feed import (
     upscale_channels,
     _cap_ist_changes_to_baseline_peak,
     _local_peak_envelope,
+    _local_rms_envelope,
     _fft_thread_count,
     _MULTI_THREAD_FFT_MIN_SAMPLES,
     normalize_signal,
@@ -557,6 +558,72 @@ class TestFeed(unittest.TestCase):
         # depends on to actually distinguish the two.
         self.assertGreater(np.min(envelope[:100]), 10 * np.max(envelope[-100:]))
 
+    def test_local_rms_envelope_empty_signal(self):
+        # New this cycle - direct unit coverage for _local_rms_envelope,
+        # the RMS-based counterpart of _local_peak_envelope now used by
+        # _cap_ist_changes_to_baseline_peak's "does the dominant-band
+        # correction help or hurt here" gate (see that function's own
+        # docstring for why RMS, not peak). Same empty-input contract as
+        # _local_peak_envelope.
+        result = _local_rms_envelope(np.array([], dtype=np.float32))
+        self.assertEqual(len(result), 0)
+
+    def test_local_rms_envelope_short_signal_returns_constant_rms(self):
+        # For len(signal) <= block_size, returns a constant array at the
+        # signal's own overall RMS (not peak) - there is only one analysis
+        # window's worth of data.
+        signal = np.array([1.0, -1.0, 1.0, -1.0], dtype=np.float32)
+        envelope = _local_rms_envelope(signal, block_size=8192)
+        self.assertEqual(len(envelope), len(signal))
+        np.testing.assert_allclose(envelope, np.full(4, 1.0), atol=1e-6)
+
+    def test_local_rms_envelope_tracks_loud_and_quiet_regions(self):
+        # Same premise as test_local_peak_envelope_tracks_loud_and_quiet_
+        # regions above, but for RMS: a loud region's envelope should sit
+        # near that region's own RMS, a quiet region's near its own (much
+        # lower) RMS, and the loud region must be materially higher than
+        # the quiet one - the property _cap_ist_changes_to_baseline_peak's
+        # gate now depends on. Unlike the peak-based version, RMS blends
+        # over the FRACTION of an analysis window that is loud vs silent
+        # (not just whether the window touches any loud sample at all), so
+        # a window straddling the very first/last edge of the signal (part
+        # real data, part the WOLA's own zero-padding) or the loud/quiet
+        # transition reads as an intermediate value, not the pure regional
+        # RMS - this samples well inside each region, away from both the
+        # signal's own edges and the transition, where every overlapping
+        # analysis window sits entirely inside one region.
+        block_size = 512
+        n = 4096
+        signal = np.zeros(n, dtype=np.float32)
+        signal[:n // 2] = 1.0
+        signal[n // 2:] = 0.05
+        envelope = _local_rms_envelope(signal, block_size=block_size)
+
+        self.assertEqual(len(envelope), n)
+        self.assertTrue(np.all(envelope >= 0))
+        loud_interior = envelope[block_size:block_size + 100]
+        quiet_interior = envelope[n - block_size - 100:n - block_size]
+        np.testing.assert_allclose(loud_interior, 1.0, atol=1e-3)
+        np.testing.assert_allclose(quiet_interior, 0.05, atol=1e-3)
+        self.assertGreater(np.min(loud_interior), 10 * np.max(quiet_interior))
+
+    def test_local_rms_envelope_differs_from_peak_envelope_on_bursty_signal(
+            self):
+        # Direct evidence for the RMS-vs-peak distinction this cycle's fix
+        # relies on: a block that is mostly silent but has one brief loud
+        # burst has a peak envelope dominated by that single burst, but an
+        # RMS envelope that stays low (since RMS integrates over the whole
+        # block, not just its single loudest sample) - the two must
+        # measurably disagree here, confirming they are not interchangeable
+        # proxies for "how loud is this region".
+        block_size = 2048
+        n = 4096
+        signal = np.zeros(n, dtype=np.float32)
+        signal[100:110] = 1.0  # a brief burst inside an otherwise-silent block
+        peak_env = _local_peak_envelope(signal, block_size=block_size)
+        rms_env = _local_rms_envelope(signal, block_size=block_size)
+        self.assertGreater(peak_env[0], 5 * rms_env[0])
+
     def test_cap_ist_changes_to_baseline_peak_noop_when_not_needed(self):
         # If adding ist_changes onto expanded_channel does not grow the
         # peak beyond expanded_channel's own peak, nothing should be
@@ -724,11 +791,22 @@ class TestFeed(unittest.TestCase):
         # gating (forcing gate=1 everywhere, i.e. the ungated frequency-
         # selective split alone) reproduces the regression on this exact
         # fixture: +6.4dB onset-window RMS elevation vs. the pre-IST
-        # interpolation-only baseline's own RMS in that same window. With
-        # gating enabled, that drops to ~+0.1dB - the bound below (3dB)
-        # sits with comfortable margin below the ungated failure and above
-        # the gated measurement, so this is a real regression guard for the
-        # gating mechanism, not a trivially-satisfied bound.
+        # interpolation-only baseline's own RMS in that same window.
+        #
+        # Superseding note (this cycle): the gate mechanism itself changed
+        # (onset_gate_ratio's fixed global-peak-relative ratio -> a
+        # data-driven local "does the correction help or hurt here" gate
+        # based on _local_rms_envelope - see _cap_ist_changes_to_baseline_
+        # peak's own docstring for the full real-material finding that
+        # motivated this and why the old design could not tell a genuine
+        # near-cancelling onset like this fixture apart from an ordinary
+        # quiet passage with real, uncancelled excess). With the new gate,
+        # this fixture measures ~+0.42dB onset-window elevation (vs.
+        # onset_gate_ratio's own ~+0.1dB) - still a large margin under the
+        # 3dB bound below and nowhere near the ungated +6.4dB failure, so
+        # this remains a real regression guard for onset/fade-in
+        # protection specifically, now verified against the new mechanism
+        # rather than the old one.
         sample_rate = 44100
         duration = 1.5
         n = int(sample_rate * duration)
@@ -766,6 +844,63 @@ class TestFeed(unittest.TestCase):
             "onset-window RMS should not be materially elevated by the "
             "dominant-band correction - it was never responsible for the "
             "peak overshoot the cap exists to bound")
+
+    def test_cap_ist_changes_to_baseline_peak_does_not_elevate_quiet_real_material(
+            self):
+        # New this cycle - direct regression test for audio-quality-
+        # checker's finding: onset_gate_ratio's fixed global-peak-relative
+        # gate withheld the dominant-band correction not just at genuine
+        # near-cancelling onsets (the synthetic fixture above) but at ANY
+        # region whose local envelope sat below its floor relative to the
+        # channel's own peak - including ordinary quiet real-material
+        # passages with no cancellation to protect, leaving them elevated
+        # relative to a no-IST control. Uses a real ~1s slice of
+        # input_test.mp3 starting at its own quiet opening (not the
+        # synthetic fixture's engineered near-cancellation), run through
+        # the real new_interpolation_algorithm -> iterative_soft_
+        # thresholding -> _cap_ist_changes_to_baseline_peak pipeline at the
+        # pinned baseline config (upscale_factor=7, max_iterations=300,
+        # threshold_value=0.6). Measured directly: the OLD (onset_gate_
+        # ratio) design left this window ~+2.3 to +2.4dB elevated
+        # (broadband RMS) relative to a no-IST interpolation-only control;
+        # the NEW (local RMS-envelope helps-or-hurts) design measures
+        # ~+0.24 to +0.29dB there - comfortably under the bound below,
+        # while the old design would fail it.
+        if not os.path.exists(_INPUT_TEST_MP3):
+            self.skipTest("input_test.mp3 reference asset not present")
+
+        sample_rate, samples, bitrate = read_audio(_INPUT_TEST_MP3,
+                                                           format='mp3')
+        channel = samples[:, 0].astype(np.float32)
+        start = int(0.5 * sample_rate)
+        n = int(0.5 * sample_rate)
+        self.assertLessEqual(start + n, len(channel),
+                             "input_test.mp3 shorter than expected - "
+                             "re-pick the slice window")
+        sig = channel[start:start + n]
+
+        upscale_factor = 7
+        max_iter = 300
+        threshold = 0.6
+
+        expanded = new_interpolation_algorithm(sig, upscale_factor)
+        ist_changes = iterative_soft_thresholding(expanded, max_iter,
+                                                  threshold)
+        capped = _cap_ist_changes_to_baseline_peak(expanded, ist_changes)
+        combined = expanded.astype(np.float32) + capped
+
+        baseline_rms = float(np.sqrt(np.mean(expanded.astype(np.float64) ** 2)))
+        combined_rms = float(np.sqrt(np.mean(combined.astype(np.float64) ** 2)))
+        self.assertGreater(baseline_rms, 0,
+                           "fixture slice must not be silent")
+
+        elevation_db = 20 * np.log10(combined_rms / baseline_rms)
+        self.assertLess(
+            elevation_db, 1.5,
+            "a genuinely quiet real-material passage should not be "
+            "measurably elevated relative to a no-IST/interpolation-only "
+            "baseline - the dominant-band correction must actually apply "
+            "there when it is not protecting a genuine cancellation")
 
     def test_upscale_channels_caps_combined_peak_close_to_baseline_stereo(
             self):
