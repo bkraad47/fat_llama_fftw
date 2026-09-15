@@ -452,7 +452,7 @@ def _local_peak_envelope(signal, block_size=8192):
 
 def _cap_ist_changes_to_baseline_peak(expanded_channel, ist_changes,
                                       max_rounds=20, dominant_band_ratio=0.002,
-                                      safety_margin=1.2):
+                                      safety_margin=1.2, onset_gate_ratio=0.3):
     # perform_ist_iteration's peak-relative FFT threshold keeps/boosts
     # whichever frequency dominates a block's own spectrum - for real
     # music that is usually low-frequency content, since natural audio
@@ -573,13 +573,50 @@ def _cap_ist_changes_to_baseline_peak(expanded_channel, ist_changes,
     # ~0.5s. The fix: taper the dominant-band correction itself,
     # (1 - dominant_scale) * dominant_component, by a smooth local-peak-
     # envelope estimate of expanded_channel (the pre-IST baseline) - see
-    # _local_peak_envelope above - via gate = clip(envelope / baseline_peak,
-    # 0, 1). A quiet/onset region (gate near 0) then receives little to
-    # none of the correction, since it was never responsible for the
-    # overshoot; a region near the channel's own peak (gate near 1)
-    # receives the full correction the frequency-selective split computed.
-    # The same gating is applied to the safety-net fallback's own
-    # correction below, for consistency.
+    # _local_peak_envelope above.
+    #
+    # This cycle's regression and its fix: the first version of this gate
+    # (gate = clip(envelope / baseline_peak, 0, 1), i.e. gated purely
+    # relative to the channel's single loudest instant) was measured
+    # directly on real programme material (input_test.mp3's own loudest
+    # 3s region) to sit at gate<1 for 99.6% of samples, median ~0.58 - real
+    # music has a crest factor (a typical block's own local peak well
+    # below the track's single loudest moment) almost everywhere, not just
+    # at genuine quiet onsets/fade-ins, so that design suppressed the
+    # dominant-band correction almost everywhere instead of only where the
+    # onset fix was meant to apply it: ist_changes retained 24-29% of its
+    # own uncapped peak on real material instead of the ~7-13% max_rounds
+    # was tuned to (see comment above), and the surviving LF-dominated
+    # excess showed up post-normalize as a ~1.0-1.55dB 20-300Hz boost that
+    # taxed every other band.
+    #
+    # The fix: gate on the envelope's ratio to baseline_peak relative to a
+    # small onset_gate_ratio floor, not to 1.0 directly - gate =
+    # clip((envelope / baseline_peak) / onset_gate_ratio, 0, 1). This
+    # saturates to gate=1 (the full correction the frequency-selective
+    # split computed) as soon as the local envelope reaches
+    # onset_gate_ratio of the channel's own peak, rather than requiring it
+    # approach that peak directly - ordinary crest-factor variation across
+    # a track's loud passages (measured min ratio ~0.45 on the same real
+    # slice above) now saturates the gate to 1 throughout, restoring the
+    # design's normal engagement there (measured: retention back down to
+    # ~13.5%, in-range), while a genuinely quiet passage or fade-in onset
+    # (measured ratio down to ~0.01-0.03 at the start of the same track,
+    # and as low as the floor~0.02 on the synthetic fade-in fixture this
+    # mechanism was built for) still falls well below the floor and gates
+    # down toward 0 as before. onset_gate_ratio=0.3 was chosen from this
+    # same measurement: every onset_gate_ratio in roughly [0.05, 0.35]
+    # keeps the fade-in fixture's onset-window RMS elevation comfortably
+    # under the 3dB regression bound (0.3 measures ~+0.03dB there, vs. the
+    # ungated failure's +6.4dB), and every value up to ~0.35 already
+    # saturates to gate=1 throughout the real loud-material slice (whose
+    # own min ratio is ~0.45) - 0.3 sits with margin inside both bounds
+    # rather than at either edge. A region near the channel's own peak
+    # (gate at/near 1) receives the full correction the frequency-selective
+    # split computed; a genuinely quiet/onset region (gate near 0) still
+    # receives little to none of it, since it was never responsible for
+    # the overshoot. The same gating is applied to the safety-net
+    # fallback's own correction below, for consistency.
     baseline_peak = np.max(np.abs(expanded_channel))
     if baseline_peak == 0:
         return ist_changes
@@ -625,7 +662,7 @@ def _cap_ist_changes_to_baseline_peak(expanded_channel, ist_changes,
         scaled_dominant = dominant_component * dominant_scale
 
     envelope = _local_peak_envelope(expanded_channel)
-    gate = np.clip(envelope / baseline_peak, 0.0, 1.0)
+    gate = np.clip((envelope / baseline_peak) / onset_gate_ratio, 0.0, 1.0)
 
     dominant_correction = (1 - dominant_scale) * dominant_component
     gated_dominant = dominant_component - gate * dominant_correction

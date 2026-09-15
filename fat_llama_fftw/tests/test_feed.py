@@ -505,6 +505,58 @@ class TestFeed(unittest.TestCase):
         expected = new_interpolation_algorithm(channel, 2)[:, np.newaxis]
         np.testing.assert_allclose(output, expected, atol=1e-6)
 
+    def test_local_peak_envelope_empty_signal(self):
+        # Coverage-gap fix flagged by audio-quality-checker: _local_peak_
+        # envelope was imported but never directly exercised anywhere in
+        # this file (only indirectly, through
+        # _cap_ist_changes_to_baseline_peak's own call site) - these three
+        # tests give it direct unit coverage. Empty input must short-
+        # circuit to an empty array (matching iterative_soft_thresholding's
+        # own division-by-zero-avoiding empty-input handling elsewhere in
+        # this module), not raise on an empty np.max.
+        result = _local_peak_envelope(np.array([], dtype=np.float32))
+        self.assertEqual(len(result), 0)
+
+    def test_local_peak_envelope_short_signal_returns_constant_peak(self):
+        # For len(signal) <= block_size, the function's own docstring says
+        # it returns a constant array at the signal's own overall peak -
+        # there is only one analysis window's worth of data, so there is
+        # nothing to vary across.
+        signal = np.array([0.1, -0.5, 0.3, -0.2], dtype=np.float32)
+        envelope = _local_peak_envelope(signal, block_size=8192)
+        self.assertEqual(len(envelope), len(signal))
+        np.testing.assert_allclose(envelope, np.full(4, 0.5), atol=1e-6)
+
+    def test_local_peak_envelope_tracks_loud_and_quiet_regions(self):
+        # For a signal longer than block_size, the envelope must track
+        # each region's own local peak (this is the whole premise
+        # _cap_ist_changes_to_baseline_peak's envelope gate relies on -
+        # see this cycle's own fix there): a loud region's envelope should
+        # sit near that region's own peak, a quiet region's envelope near
+        # its own (much lower) peak, with the WOLA reconstruction keeping
+        # the envelope non-negative and correctly shaped (not, e.g.,
+        # inverted or off-by-a-block).
+        block_size = 512
+        n = 4096
+        signal = np.zeros(n, dtype=np.float32)
+        signal[:n // 2] = 1.0
+        signal[n // 2:] = 0.05
+        envelope = _local_peak_envelope(signal, block_size=block_size)
+
+        self.assertEqual(len(envelope), n)
+        self.assertTrue(np.all(envelope >= 0))
+        # Well inside the loud region (away from the transition's own
+        # blending), the envelope should sit at essentially the loud
+        # region's own peak (1.0); well inside the quiet region, at
+        # essentially the quiet region's own peak (0.05) - not some
+        # blended/averaged value from the other region.
+        np.testing.assert_allclose(envelope[:100], 1.0, atol=1e-3)
+        np.testing.assert_allclose(envelope[-100:], 0.05, atol=1e-3)
+        # And the loud region's envelope must be materially higher than
+        # the quiet region's - the core property the peak-cap's gate
+        # depends on to actually distinguish the two.
+        self.assertGreater(np.min(envelope[:100]), 10 * np.max(envelope[-100:]))
+
     def test_cap_ist_changes_to_baseline_peak_noop_when_not_needed(self):
         # If adding ist_changes onto expanded_channel does not grow the
         # peak beyond expanded_channel's own peak, nothing should be
@@ -832,6 +884,24 @@ class TestFeed(unittest.TestCase):
         lf_ratio_db = 20 * np.log10(
             band_mag(final_ist, lf_freq) / band_mag(final_ctrl, lf_freq))
         self.assertGreater(lf_ratio_db, -1.0)
+        # Coverage-gap fix flagged by audio-quality-checker: an envelope-
+        # gating regression (this cycle's own fix target - an overly broad
+        # gate that suppressed the peak-cap's correction almost everywhere
+        # on real material, not just genuine quiet onsets) showed up as an
+        # LF *boost*, not an attenuation - nothing here previously bounded
+        # that direction, so a whole class of regression could pass this
+        # suite while still failing audio-quality-checker. This fixture's
+        # own single sustained low tone does not by itself discriminate
+        # the two gate designs (its envelope is ~constant near the
+        # channel's own peak throughout, so both saturate to the same
+        # result here - measured identical -0.0996dB either way), but the
+        # bound is still real defensive coverage: a materially different
+        # (much larger) boost mechanism would still trip it. See
+        # test_upscale_channels_ist_does_not_net_attenuate_real_material's
+        # own low_band_ratio_db check below for the fixture that actually
+        # discriminates the two gate designs on real, non-stationary
+        # material.
+        self.assertLess(lf_ratio_db, 1.0)
 
     def test_upscale_channels_ist_does_not_net_attenuate_real_material(self):
         # Coverage-gap regression test flagged by audio-quality-checker this
@@ -920,6 +990,38 @@ class TestFeed(unittest.TestCase):
         # slice/config, while still catching a regression back toward the
         # pre-max_rounds=20-tuning ~-1.0 to -1.24dB level or worse.
         self.assertGreater(hs_ratio_db, -1.0)
+
+        # Coverage-gap fix flagged by audio-quality-checker (this cycle):
+        # the envelope-gate regression this cycle fixes (gating the peak
+        # cap's dominant-band correction purely relative to the channel's
+        # single loudest instant, rather than to a floor closer to
+        # "typical" loudness - see _cap_ist_changes_to_baseline_peak's own
+        # comment) showed up on exactly this real slice as a low-band
+        # *boost* (ist_changes retaining far more of its own uncapped peak
+        # than intended), not an attenuation - the pre-existing
+        # attenuation-only bound above (hs_ratio_db > -1.0) stayed green
+        # throughout that regression, since a boost in one band and an
+        # attenuation elsewhere from the same mandatory final normalize
+        # are two sides of the same bug. Directly reproduced by
+        # temporarily reverting the gate to that broken design (measured
+        # here): low_band_ratio_db went from +0.023dB (this fix) to
+        # +1.217dB (broken) on this exact slice/config - a materially
+        # different, clearly distinguishable result, unlike the synthetic
+        # fixture in test_upscale_channels_ist_does_not_net_attenuate_
+        # untouched_band above (whose near-constant-envelope tone does not
+        # discriminate the two gate designs). 0.5dB sits with real margin
+        # above the fixed measurement and well below the broken one.
+        def low_band_mag(x):
+            spec = np.abs(np.fft.rfft(x.astype(np.float64)))
+            freqs = np.fft.rfftfreq(len(x), d=1.0 / new_sample_rate)
+            mask = (freqs >= 20) & (freqs < 300)
+            self.assertTrue(mask.any())
+            return float(np.sqrt(np.mean(spec[mask] ** 2)))
+
+        lb_ctrl_mag = low_band_mag(final_ctrl)
+        self.assertGreater(lb_ctrl_mag, 0)
+        lb_ratio_db = 20 * np.log10(low_band_mag(final_ist) / lb_ctrl_mag)
+        self.assertLess(lb_ratio_db, 0.5)
 
     def test_iterative_soft_thresholding_chains_across_iterations(self):
         data = np.array([0.9, 0.1, -0.8, 0.05, 0.7, -0.2, 0.3, -0.6],
