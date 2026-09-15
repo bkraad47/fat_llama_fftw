@@ -11,6 +11,7 @@ from fat_llama_fftw.audio_fattener.feed import (
     iterative_soft_thresholding,
     upscale_channels,
     _cap_ist_changes_to_baseline_peak,
+    _local_peak_envelope,
     _fft_thread_count,
     _MULTI_THREAD_FFT_MIN_SAMPLES,
     normalize_signal,
@@ -563,6 +564,84 @@ class TestFeed(unittest.TestCase):
         self.assertGreater(float(np.max(np.abs(capped))),
                            0.01 * float(np.max(np.abs(ist_changes))))
 
+    def test_cap_ist_changes_to_baseline_peak_preserves_quiet_band(self):
+        # New this cycle - regression test for the frequency-selective
+        # dominant/residual split ported from the CUDA sibling repo's own
+        # v-2.0.0 (translated cupy -> numpy/pyfftw here): the previous fix
+        # (a whole-signal uniform-scalar shrink) bounded the combined peak
+        # by shrinking ALL of ist_changes by the same ratio, even though
+        # only the loud, low-frequency component actually caused the
+        # overshoot - suppressing IST's genuinely-added quiet/high-
+        # frequency detail nearly as much as the dominant band responsible
+        # for it. This fixture isolates that: ist_changes carries a loud
+        # low-frequency tone (the overshoot cause) plus a much quieter
+        # high-frequency tone (genuinely-added detail, well below
+        # dominant_band_ratio's default 0.002 of the spectrum's own peak
+        # magnitude) landing exactly on an FFT bin (n=4410 at 44100Hz gives
+        # exactly 10Hz/bin, so both 200Hz and 15000Hz land on-bin with no
+        # spectral leakage to confound the measurement). The quiet tone's
+        # own FFT magnitude must survive essentially untouched (>90%)
+        # while the combined peak is still bounded close to baseline -
+        # verifying the split leaves the residual component alone rather
+        # than just reducing the old shrink's collateral damage.
+        n = 4410
+        sample_rate = 44100
+        t = np.arange(n) / sample_rate
+        low_freq, high_freq = 200.0, 15000.0
+
+        expanded = (0.8 * np.sin(2 * np.pi * low_freq * t)).astype(np.float32)
+        ist_changes = (
+            1.0 * np.sin(2 * np.pi * low_freq * t)
+            + 0.0005 * np.sin(2 * np.pi * high_freq * t)
+        ).astype(np.float32)
+
+        baseline_peak = float(np.max(np.abs(expanded)))
+        uncapped_peak = float(np.max(np.abs(expanded + ist_changes)))
+        self.assertGreater(
+            uncapped_peak, baseline_peak,
+            "fixture must actually overshoot to exercise the cap")
+
+        def high_band_mag(signal):
+            spec = np.abs(np.fft.rfft(np.asarray(signal, dtype=np.float64)))
+            freqs = np.fft.rfftfreq(n, d=1.0 / sample_rate)
+            idx = int(np.argmin(np.abs(freqs - high_freq)))
+            return float(spec[idx])
+
+        pre_mag = high_band_mag(ist_changes)
+        capped = _cap_ist_changes_to_baseline_peak(expanded, ist_changes)
+        post_mag = high_band_mag(capped)
+
+        self.assertGreater(
+            post_mag, 0.9 * pre_mag,
+            "quiet high-frequency band should survive the cap essentially "
+            "untouched, not be shrunk along with the dominant band")
+
+        combined_peak = float(np.max(np.abs(expanded + capped)))
+        self.assertLess(combined_peak, baseline_peak * 1.2)
+
+    def test_cap_ist_changes_to_baseline_peak_pathological_ratio_falls_back(
+            self):
+        # New this cycle - a dominant_band_ratio so high (1.5, meaning a
+        # bin would need to exceed 150% of the spectrum's own peak
+        # magnitude to be classified "dominant") that nothing is ever
+        # classified as dominant. The frequency-selective split alone
+        # cannot bound the peak in that case (there is nothing to shrink),
+        # so the safety-net whole-signal uniform-shrink fallback (the
+        # pre-existing method, unchanged) must still engage and bound the
+        # combined peak at least as well as the old uniform-shrink-only
+        # implementation did.
+        expanded = np.array([10.0, 10.0, -10.0, -10.0], dtype=np.float32)
+        ist_changes = np.array([15.0, 15.0, -15.0, -15.0], dtype=np.float32)
+        baseline_peak = float(np.max(np.abs(expanded)))
+
+        capped = _cap_ist_changes_to_baseline_peak(
+            expanded, ist_changes, dominant_band_ratio=1.5)
+        combined_peak = float(np.max(np.abs(expanded + capped)))
+
+        self.assertLess(combined_peak, baseline_peak * 1.1)
+        self.assertGreater(float(np.max(np.abs(capped))),
+                           0.01 * float(np.max(np.abs(ist_changes))))
+
     def test_cap_ist_changes_to_baseline_peak_zero_baseline(self):
         # Guards the baseline_peak == 0 short-circuit - dividing by a zero
         # baseline peak would be a degenerate no-op cap rather than an
@@ -571,6 +650,109 @@ class TestFeed(unittest.TestCase):
         ist_changes = np.array([1.0, -1.0, 2.0, -2.0], dtype=np.float32)
         result = _cap_ist_changes_to_baseline_peak(expanded, ist_changes)
         np.testing.assert_allclose(result, ist_changes, atol=1e-6)
+
+    def test_cap_ist_changes_to_baseline_peak_envelope_gates_quiet_onset(
+            self):
+        # New this cycle - regression test for the envelope-gated fix
+        # ported from the CUDA sibling repo's v-2.0.0: applying the
+        # frequency-selective dominant/residual split's fixed scalar
+        # correction uniformly across a non-stationary buffer breaks a
+        # near-exact dominant/residual cancellation that (uncapped)
+        # reconstructs a real quiet onset - "unmasking" energy specifically
+        # where the signal is quietest. Uses a broadband (multi-tone),
+        # raised-cosine fade-in synthetic channel (silence-adjacent, not
+        # exactly zero, per the directive) run through the REAL
+        # new_interpolation_algorithm -> iterative_soft_thresholding ->
+        # _cap_ist_changes_to_baseline_peak pipeline (long enough - 1.5s at
+        # 44100Hz, > block_size after upscaling - to exercise the blocked
+        # WOLA path, not just a short whole-signal chain).
+        #
+        # Directly confirmed via a monkeypatched experiment (not shipped,
+        # only used to validate this test's own premise) that disabling
+        # gating (forcing gate=1 everywhere, i.e. the ungated frequency-
+        # selective split alone) reproduces the regression on this exact
+        # fixture: +6.4dB onset-window RMS elevation vs. the pre-IST
+        # interpolation-only baseline's own RMS in that same window. With
+        # gating enabled, that drops to ~+0.1dB - the bound below (3dB)
+        # sits with comfortable margin below the ungated failure and above
+        # the gated measurement, so this is a real regression guard for the
+        # gating mechanism, not a trivially-satisfied bound.
+        sample_rate = 44100
+        duration = 1.5
+        n = int(sample_rate * duration)
+        t = np.arange(n) / sample_rate
+
+        fade_len = int(0.3 * sample_rate)
+        envelope_shape = np.ones(n)
+        ramp = 0.5 - 0.5 * np.cos(np.pi * np.arange(fade_len) / fade_len)
+        floor = 0.02  # silence-adjacent, not exactly zero
+        envelope_shape[:fade_len] = floor + (1 - floor) * ramp
+
+        freqs = [300.0, 1200.0, 3000.0, 7000.0]
+        sig = np.zeros(n)
+        for f in freqs:
+            sig += np.sin(2 * np.pi * f * t)
+        sig = sig / np.max(np.abs(sig))
+        sig = (sig * envelope_shape).astype(np.float32)
+
+        upscale_factor = 2
+        expanded = new_interpolation_algorithm(sig, upscale_factor)
+        ist_changes = iterative_soft_thresholding(expanded, max_iter=100,
+                                                  threshold=0.6)
+        capped = _cap_ist_changes_to_baseline_peak(expanded, ist_changes)
+
+        onset = 1024
+        rms_before = float(np.sqrt(np.mean(
+            expanded[:onset].astype(np.float64) ** 2)))
+        combined = expanded.astype(np.float32) + capped
+        rms_after = float(np.sqrt(np.mean(
+            combined[:onset].astype(np.float64) ** 2)))
+
+        db_elevation = 20 * np.log10(rms_after / max(rms_before, 1e-12))
+        self.assertLess(
+            db_elevation, 3.0,
+            "onset-window RMS should not be materially elevated by the "
+            "dominant-band correction - it was never responsible for the "
+            "peak overshoot the cap exists to bound")
+
+    def test_upscale_channels_caps_combined_peak_close_to_baseline_stereo(
+            self):
+        # New this cycle - end-to-end wiring check that upscale_channels
+        # itself (not just _cap_ist_changes_to_baseline_peak in isolation)
+        # keeps each channel's combined (interpolation + IST) peak close to
+        # its own pre-IST interpolation baseline, for a genuinely
+        # multi-channel (stereo) input - closes the gap that the isolated
+        # helper tests above never exercise the real call site's own
+        # per-channel wiring (_process_channel) or thread-pool dispatch
+        # path.
+        sample_rate = 44100
+        duration = 0.2
+        n = int(sample_rate * duration)
+        t = np.arange(n) / sample_rate
+        left = (10000.0 * np.sin(2 * np.pi * 220.0 * t)
+               + 500.0 * np.sin(2 * np.pi * 9000.0 * t)).astype(np.float32)
+        right = (8000.0 * np.sin(2 * np.pi * 330.0 * t)
+                + 400.0 * np.sin(2 * np.pi * 11000.0 * t)).astype(np.float32)
+        channels = np.column_stack([left, right])
+
+        upscale_factor = 3
+        max_iter = 100
+        threshold = 0.6
+
+        result = upscale_channels(channels, upscale_factor, max_iter,
+                                  threshold)
+
+        for i, channel in enumerate([left, right]):
+            baseline = new_interpolation_algorithm(channel, upscale_factor)
+            baseline_peak = float(np.max(np.abs(baseline)))
+            combined_peak = float(np.max(np.abs(result[:, i])))
+            # Bounded shrink, not exact convergence (see
+            # _cap_ist_changes_to_baseline_peak's own docstring) - allow
+            # some headroom above baseline_peak while still confirming the
+            # cap materially bounds growth, not just a token amount.
+            self.assertLess(combined_peak, baseline_peak * 1.25,
+                            f"channel {i} combined peak not bounded close "
+                            "to its own pre-IST interpolation baseline")
 
     def test_upscale_channels_ist_does_not_net_attenuate_untouched_band(self):
         # Direct regression test for this cycle's highest-priority finding

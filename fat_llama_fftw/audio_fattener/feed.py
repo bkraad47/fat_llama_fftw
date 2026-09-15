@@ -397,8 +397,62 @@ def iterative_soft_thresholding(data, max_iter, threshold,
     return output[pad:pad + n].astype(np.float32)
 
 
+def _local_peak_envelope(signal, block_size=8192):
+    """Smooth, WOLA-based local-peak-magnitude envelope of `signal`.
+
+    Estimates each block_size-sample analysis window's own peak magnitude
+    (max(abs(.)) of that windowed block) and reconstructs a smooth envelope
+    via the same 50%-hop sqrt-Hann analysis/synthesis windowed-overlap-add
+    (WOLA) machinery iterative_soft_thresholding already uses for its own
+    block reconstruction above - a scalar "block peak" value is broadcast
+    across the block and accumulated with the identical window**2 weighting
+    iterative_soft_thresholding uses, rather than reinventing a second,
+    differently-normalized WOLA. This is intentionally a separate, smaller
+    function (not a refactor of iterative_soft_thresholding's own loop)
+    so this new envelope estimate carries zero risk to that function's own,
+    already-tested WOLA/DC-leak-correction behavior - the two share the
+    same window/hop/overlap-add *shape*, not a code path.
+
+    Used by _cap_ist_changes_to_baseline_peak to gate its frequency-
+    selective correction: a channel's own quiet/onset regions (low local
+    envelope relative to the channel's overall peak) should receive little
+    to none of that correction, since they were never responsible for the
+    peak overshoot the correction exists to bound.
+    """
+    n = len(signal)
+    if n == 0:
+        return np.zeros(0, dtype=np.float32)
+    if n <= block_size:
+        return np.full(n, np.max(np.abs(signal)), dtype=np.float32)
+
+    hop = block_size // 2
+    window = np.sqrt(
+        0.5 - 0.5 * np.cos(2 * np.pi * np.arange(block_size) / block_size))
+
+    pad = hop
+    padded = np.concatenate([
+        np.zeros(pad, dtype=np.float64),
+        np.asarray(signal, dtype=np.float64),
+        np.zeros(block_size, dtype=np.float64),
+    ])
+    padded_len = len(padded)
+
+    output = np.zeros(padded_len, dtype=np.float64)
+    weight = np.zeros(padded_len, dtype=np.float64)
+    window_sq = window * window
+    for start in range(0, padded_len - block_size + 1, hop):
+        block_peak = np.max(np.abs(padded[start:start + block_size]))
+        output[start:start + block_size] += block_peak * window_sq
+        weight[start:start + block_size] += window_sq
+
+    safe_weight = np.where(weight > 1e-8, weight, 1.0)
+    envelope = output / safe_weight
+    return envelope[pad:pad + n].astype(np.float32)
+
+
 def _cap_ist_changes_to_baseline_peak(expanded_channel, ist_changes,
-                                      max_rounds=20):
+                                      max_rounds=20, dominant_band_ratio=0.002,
+                                      safety_margin=1.2):
     # perform_ist_iteration's peak-relative FFT threshold keeps/boosts
     # whichever frequency dominates a block's own spectrum - for real
     # music that is usually low-frequency content, since natural audio
@@ -480,17 +534,126 @@ def _cap_ist_changes_to_baseline_peak(expanded_channel, ist_changes,
     # own assessment that a scalar-rescale-based fix is close to its
     # practical limit for this mechanism - max_rounds=20 is the verified
     # improvement available within that limit, not a full fix.
+    #
+    # This cycle ported two further refinements from the CUDA sibling repo
+    # (bkraad47/fat_llama)'s own v-2.0.0 branch - pure numpy/FFT logic,
+    # translated cupy -> numpy/pyfftw here, no CUDA-specific mechanism:
+    #
+    # 1. Frequency-selective dominant/residual split. The whole-signal
+    # uniform scalar shrink above rescales EVERY sample of ist_changes by
+    # the same ratio, even though only whichever frequency band actually
+    # dominates its own spectrum is responsible for the overshoot (natural
+    # spectra concentrate energy at low frequencies - see this function's
+    # own comment above). That means quiet/high-frequency detail IST
+    # genuinely added - exactly the content this whole cap mechanism exists
+    # to *keep* - gets suppressed by nearly the same ratio as the dominant
+    # band, even though it never caused the peak growth being corrected.
+    # Measured directly on a loud-low-tone/quiet-high-tone fixture: the
+    # quiet band survived the old uniform shrink at only ~4% of its own
+    # uncapped magnitude. Splitting ist_changes' own rfft spectrum into a
+    # "dominant" component (bins whose magnitude >= dominant_band_ratio
+    # times the spectrum's own peak magnitude) and a "residual" component
+    # (everything else), then applying the exact same bounded iterative
+    # shrink as above but scoped to ONLY the dominant component (leaving
+    # residual untouched), keeps the same overshoot-bounding mechanism
+    # while no longer taxing content the dominant band never touched.
+    #
+    # 2. Envelope-gated correction. Splitting via a single whole-buffer FFT
+    # and applying one fixed scalar correction to the dominant component is
+    # itself found (this cycle, via a broadband raised-cosine fade-in
+    # fixture) to be a problem for genuinely non-stationary material: a
+    # real track's quiet onset is often reconstructed by a near-exact
+    # cancellation between what this split calls "dominant" and "residual"
+    # content (both derived from the same whole-buffer spectrum, so they
+    # necessarily overlap in time even though they're disjoint in
+    # frequency). Shrinking only the dominant component by a fixed scalar
+    # breaks that cancellation, "unmasking" disproportionate energy
+    # specifically where the real signal is quietest - measured on the CUDA
+    # sibling as up to +18.5dB frame-RMS elevation in a fade-in's first
+    # ~0.5s. The fix: taper the dominant-band correction itself,
+    # (1 - dominant_scale) * dominant_component, by a smooth local-peak-
+    # envelope estimate of expanded_channel (the pre-IST baseline) - see
+    # _local_peak_envelope above - via gate = clip(envelope / baseline_peak,
+    # 0, 1). A quiet/onset region (gate near 0) then receives little to
+    # none of the correction, since it was never responsible for the
+    # overshoot; a region near the channel's own peak (gate near 1)
+    # receives the full correction the frequency-selective split computed.
+    # The same gating is applied to the safety-net fallback's own
+    # correction below, for consistency.
     baseline_peak = np.max(np.abs(expanded_channel))
     if baseline_peak == 0:
         return ist_changes
-    current = ist_changes
+
+    expanded_f32 = expanded_channel.astype(np.float32)
+    uncapped_combined_peak = np.max(np.abs(expanded_f32 + ist_changes))
+    if uncapped_combined_peak <= baseline_peak or uncapped_combined_peak == 0:
+        return ist_changes
+
+    n = len(ist_changes)
+    spectrum = pyfftw.interfaces.numpy_fft.rfft(
+        np.asarray(ist_changes, dtype=np.float64))
+    spec_mag = np.abs(spectrum)
+    spec_peak = np.max(spec_mag)
+
+    if spec_peak == 0:
+        # Nothing to split - ist_changes is silent, so there is nothing to
+        # shrink or gate either.
+        return ist_changes
+
+    dominant_mask = spec_mag >= dominant_band_ratio * spec_peak
+    dominant_spectrum = np.where(dominant_mask, spectrum, 0)
+    residual_spectrum = np.where(dominant_mask, 0, spectrum)
+    dominant_component = pyfftw.interfaces.numpy_fft.irfft(
+        dominant_spectrum, n=n).astype(np.float32)
+    residual_component = pyfftw.interfaces.numpy_fft.irfft(
+        residual_spectrum, n=n).astype(np.float32)
+
+    # Bound only the dominant component's own contribution to the combined
+    # peak, via the same bounded multiplicative-shrink loop as the
+    # pre-existing whole-signal cap above (reused verbatim, just scoped to
+    # a scalar applied to the dominant component instead of to all of
+    # ist_changes) - residual_component never enters this loop, so it is
+    # never touched by it.
+    dominant_scale = 1.0
+    scaled_dominant = dominant_component
     for _ in range(max_rounds):
-        combined = expanded_channel.astype(np.float32) + current
+        candidate = expanded_f32 + scaled_dominant + residual_component
+        candidate_peak = np.max(np.abs(candidate))
+        if candidate_peak <= baseline_peak or candidate_peak == 0:
+            break
+        dominant_scale *= baseline_peak / candidate_peak
+        scaled_dominant = dominant_component * dominant_scale
+
+    envelope = _local_peak_envelope(expanded_channel)
+    gate = np.clip(envelope / baseline_peak, 0.0, 1.0)
+
+    dominant_correction = (1 - dominant_scale) * dominant_component
+    gated_dominant = dominant_component - gate * dominant_correction
+    candidate_result = residual_component + gated_dominant
+
+    candidate_combined_peak = np.max(np.abs(expanded_f32 + candidate_result))
+    if candidate_combined_peak <= baseline_peak * safety_margin:
+        return candidate_result
+
+    # Safety net: the frequency-selective split alone did not bound the
+    # peak closely enough (e.g. a pathological dominant_band_ratio that
+    # classifies nothing/too little as dominant) - fall back to one
+    # additional whole-signal uniform-shrink pass on top of the
+    # frequency-selective candidate, using the exact pre-existing method
+    # above (unchanged), still with the same envelope gating applied to
+    # its own correction for consistency.
+    current = candidate_result
+    fallback_scale = 1.0
+    for _ in range(max_rounds):
+        combined = expanded_f32 + current
         combined_peak = np.max(np.abs(combined))
         if combined_peak <= baseline_peak or combined_peak == 0:
             break
-        current = current * (baseline_peak / combined_peak)
-    return current
+        fallback_scale *= baseline_peak / combined_peak
+        current = candidate_result * fallback_scale
+
+    fallback_correction = (1 - fallback_scale) * candidate_result
+    return candidate_result - gate * fallback_correction
 
 
 def _process_channel(channel, upscale_factor, max_iter, threshold):
