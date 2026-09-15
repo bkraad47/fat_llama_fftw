@@ -277,6 +277,30 @@ def perform_ist_iteration(data_thres, threshold):
     # per project-mission.md). Left as fft/ifft (unchanged) - not adopting
     # this fix means there was no reason to also change the FFT
     # representation.
+    #
+    # Investigated a later cycle (again NOT adopted): whether max_iter /
+    # convergence behavior differs meaningfully between dominant (LF) and
+    # non-dominant (HF) content in a way that running more passes could
+    # exploit - a mechanism genuinely distinct from both the threshold_
+    # value experiment and the per-band variant above. Measured directly
+    # on a real 8192-sample block from input_test.mp3 (seconds 7-10,
+    # loudest region, pinned baseline upscale_factor=7): the kept-bin mask
+    # (magnitude > threshold * this pass's own FFT peak, DC excluded) is
+    # bit-for-bit identical between the very first refinement pass and the
+    # second - the fixed point this function's own docstring already
+    # claims is reached immediately, not gradually across many passes -
+    # and of the handful of bins ever kept (6, out of thousands of
+    # possible HF bins on that block), none sit at or above 2kHz. More
+    # max_iterations cannot change either fact: the same fixed point is
+    # reached whether the caller allows 2 passes or 300. See
+    # test_perform_ist_iteration_excludes_hf_and_converges_in_one_pass_on_
+    # real_block in test_feed.py for the regression coverage. This closes
+    # off "more iterations" as a lever for the still-open "no measurable
+    # added detail above ~800Hz" finding, the same way the per-band
+    # variant above closed off "a looser/differently-scoped threshold" -
+    # the gap sits entirely in this function's single hard peak-relative
+    # threshold decision on each block's first pass, not in anything
+    # iteration-count-related or downstream of it.
     data_fft = pyfftw.interfaces.numpy_fft.fft(data_thres)
     fft_peak = np.max(np.abs(data_fft))
     if fft_peak == 0:
@@ -809,6 +833,36 @@ def _cap_ist_changes_to_baseline_peak(expanded_channel, ist_changes,
     # shrink-loop mechanics, and the safety-net fallback are all otherwise
     # unchanged - only what decides "how much of the dominant-band
     # correction applies here" changed.
+    #
+    # Investigated a later cycle (NOT adopted, this function unchanged
+    # below): whether this function's own dominant/residual split - not
+    # perform_ist_iteration's retention - is what discards genuine HF
+    # detail, for the still-open "no measurable added detail below the
+    # original Nyquist frequency" DIRECTIVES finding (two prior cycles
+    # investigated threshold_value and per-band FFT thresholding instead -
+    # see perform_ist_iteration's own docstring comments - and rejected
+    # both). The dominant classification below is purely magnitude-
+    # relative across the WHOLE ist_changes spectrum (>= dominant_band_
+    # ratio, 0.2%, of that spectrum's own peak), not frequency-scoped, so
+    # in principle genuine HF content that individually clears that bar
+    # could be swept into the shrunk dominant bucket alongside genuinely-
+    # dominant LF content. Measured directly (real input_test.mp3 seconds
+    # 7-10, pinned baseline config): REFUTED. Exactly 0 of 457,051 rfft
+    # bins at/above 2kHz are ever classified dominant - 100% of HF content
+    # is already in the untouched residual bucket, never touched by the
+    # shrink loop below. This function is not a bottleneck for HF content
+    # at all; whatever HF content perform_ist_iteration produces already
+    # passes through here unshrunk. A further check - an envelope
+    # correlation between that fully-untouched HF residual and the
+    # lossless input_test.flac reference over the same window - measured
+    # ~0.01, i.e. not meaningfully correlated, independently reaching (via
+    # a mechanism genuinely different from either prior cycle's own
+    # investigation, or perform_ist_iteration's own convergence-angle
+    # investigation next to this one) the same conclusion: the missing
+    # detail was already destroyed upstream, before this function or
+    # perform_ist_iteration's own iteration count ever gets a chance to
+    # recover it. See test_cap_ist_changes_dominant_split_does_not_
+    # bottleneck_hf_content in test_feed.py for the regression coverage.
     baseline_peak = np.max(np.abs(expanded_channel))
     if baseline_peak == 0:
         return ist_changes

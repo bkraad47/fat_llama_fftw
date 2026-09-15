@@ -32,6 +32,7 @@ import fat_llama_fftw.audio_fattener.feed as feed_module
 _REPO_ROOT = os.path.abspath(
     os.path.join(os.path.dirname(__file__), '..', '..'))
 _INPUT_TEST_MP3 = os.path.join(_REPO_ROOT, 'input_test.mp3')
+_INPUT_TEST_FLAC = os.path.join(_REPO_ROOT, 'input_test.flac')
 
 class TestFeed(unittest.TestCase):
 
@@ -1195,6 +1196,219 @@ class TestFeed(unittest.TestCase):
         self.assertGreater(lb_ctrl_mag, 0)
         lb_ratio_db = 20 * np.log10(low_band_mag(final_ist) / lb_ctrl_mag)
         self.assertLess(lb_ratio_db, 0.5)
+
+    def test_cap_ist_changes_dominant_split_does_not_bottleneck_hf_content(
+            self):
+        # This cycle's investigation of the still-open DIRECTIVES finding
+        # ("no IST-attributable added detail below the original Nyquist
+        # frequency measured against a no-IST control") - a third,
+        # genuinely different attempt after two prior cycles' rejected
+        # fixes (threshold_value=0.15, and per-band FFT thresholding in
+        # perform_ist_iteration - see that function's own docstring
+        # comment). This cycle's specific hypothesis (per the dispatching
+        # task's own suggested angle): maybe perform_ist_iteration already
+        # finds real HF detail, and _cap_ist_changes_to_baseline_peak's
+        # dominant/residual split - not perform_ist_iteration's own
+        # retention - is what discards it, by misclassifying genuine HF
+        # content as "dominant" (its own classification is purely
+        # magnitude-relative across the WHOLE spectrum, at just 0.2% of
+        # the spectrum's own peak, not frequency-scoped) and then shrinking
+        # it via the bounded shrink loop.
+        #
+        # Measured directly (real input_test.mp3, seconds 7-10 - the same
+        # loud, representative slice test_upscale_channels_ist_does_not_
+        # net_attenuate_real_material above uses - at the pinned baseline
+        # config): REFUTED. Reproducing _cap_ist_changes_to_baseline_peak's
+        # own dominant-mask classification (dominant_band_ratio=0.002)
+        # directly against ist_changes' own rfft spectrum shows exactly 0
+        # of 457,051 bins at/above 2kHz are EVER classified "dominant" -
+        # 100% of HF content is already in the untouched "residual" bucket,
+        # never touched by the shrink loop at all. The cap is structurally
+        # not a bottleneck for HF content; whatever HF content perform_ist_
+        # iteration itself produces already passes through this function
+        # unshrunk.
+        #
+        # That still leaves the question of whether that untouched HF
+        # residual carries genuine, reference-correlated detail worth more
+        # exposure (e.g. via a smaller residual-side reduction elsewhere).
+        # Measured directly: an envelope correlation (500-sample rectified-
+        # magnitude moving average, band-limited to 8-19kHz) between the
+        # residual component and the lossless input_test.flac reference
+        # (interpolated the same way, over the same window) sits at ~0.01,
+        # i.e. not meaningfully correlated - consistent with (a genuinely
+        # different measurement path reaching the same conclusion as) the
+        # two prior cycles' own findings that a purely peak-relative/
+        # hard-threshold IST cannot recover genuine detail a lossy source
+        # has already destroyed. Asserted below with generous margin
+        # (0.2), not the measured ~0.01, since this is a coarse diagnostic
+        # correlation metric (not audio-quality-checker's own spectral
+        # analysis) and the point is "not meaningfully correlated", not a
+        # precise figure.
+        if not os.path.exists(_INPUT_TEST_MP3):
+            self.skipTest("input_test.mp3 reference asset not present")
+        if not os.path.exists(_INPUT_TEST_FLAC):
+            self.skipTest("input_test.flac reference asset not present")
+
+        sample_rate, mp3_samples, _ = read_audio(_INPUT_TEST_MP3,
+                                                          format='mp3')
+        _, flac_samples, _ = read_audio(_INPUT_TEST_FLAC, format='flac')
+        mp3_channel = mp3_samples[:, 0].astype(np.float32)
+        flac_channel = flac_samples[:, 0].astype(np.float32)
+        upscale_factor = 7
+        max_iter = 300
+        threshold = 0.6
+        start = 7 * sample_rate
+        n = 3 * sample_rate
+        self.assertLessEqual(start + n, len(mp3_channel),
+                             "input_test.mp3 shorter than expected - "
+                             "re-pick the slice window")
+        self.assertLessEqual(start + n, len(flac_channel),
+                             "input_test.flac shorter than expected - "
+                             "re-pick the slice window")
+
+        mp3_sig = mp3_channel[start:start + n]
+        flac_sig = flac_channel[start:start + n]
+
+        expanded = new_interpolation_algorithm(mp3_sig, upscale_factor)
+        ist_changes = iterative_soft_thresholding(expanded, max_iter,
+                                                   threshold)
+        ref_expanded = new_interpolation_algorithm(flac_sig, upscale_factor)
+        out_sr = sample_rate * upscale_factor
+
+        # Reproduce _cap_ist_changes_to_baseline_peak's own dominant-mask
+        # classification exactly (same formula/default ratio).
+        dominant_band_ratio = 0.002
+        spectrum = np.fft.rfft(ist_changes.astype(np.float64))
+        spec_mag = np.abs(spectrum)
+        spec_peak = np.max(spec_mag)
+        self.assertGreater(spec_peak, 0,
+                           "ist_changes must not be silent on this loud "
+                           "real-material slice - fixture precondition")
+        dominant_mask = spec_mag >= dominant_band_ratio * spec_peak
+        freqs = np.fft.rfftfreq(len(ist_changes), d=1.0 / out_sr)
+        hf_mask = freqs >= 2000
+
+        hf_dominant_bins = int(np.sum(dominant_mask & hf_mask))
+        self.assertEqual(
+            hf_dominant_bins, 0,
+            "the dominant/residual split should not be classifying any "
+            "HF (>=2kHz) content as 'dominant' - if it starts to, the "
+            "cap's shrink loop would become a genuine bottleneck for HF "
+            "detail and this investigation's own conclusion needs "
+            "revisiting")
+
+        residual_spectrum = np.where(dominant_mask, 0, spectrum)
+        residual_component = np.fft.irfft(residual_spectrum,
+                                          n=len(ist_changes))
+
+        def band_filtered(signal, lo, hi):
+            spec = np.fft.rfft(signal.astype(np.float64))
+            f = np.fft.rfftfreq(len(signal), d=1.0 / out_sr)
+            spec_band = np.where((f >= lo) & (f < hi), spec, 0)
+            return np.fft.irfft(spec_band, n=len(signal))
+
+        def envelope(x, block=500):
+            kernel = np.ones(block) / block
+            return np.convolve(np.abs(x), kernel, mode='same')
+
+        def corr(a, b):
+            a = a - a.mean()
+            b = b - b.mean()
+            denom = np.linalg.norm(a) * np.linalg.norm(b)
+            return float(np.dot(a, b) / denom) if denom > 0 else 0.0
+
+        res_hf = band_filtered(residual_component, 8000, 19000)
+        ref_hf = band_filtered(ref_expanded, 8000, 19000)
+        hf_correlation = corr(envelope(res_hf), envelope(ref_hf))
+        self.assertLess(
+            abs(hf_correlation), 0.2,
+            "the fully-untouched HF residual bucket should not be "
+            "meaningfully correlated with the lossless reference - a "
+            "high correlation here would mean the cap's split IS "
+            "discarding real detail somewhere else and this "
+            "investigation's conclusion needs revisiting")
+
+    def test_perform_ist_iteration_excludes_hf_and_converges_in_one_pass_on_real_block(
+            self):
+        # This cycle's second investigation angle for the same still-open
+        # DIRECTIVES finding (see the dominant-split test above for the
+        # first): maybe max_iterations/convergence behaves differently for
+        # dominant (LF) vs non-dominant (HF) content in a way more
+        # iterations could exploit, distinct from the threshold_value
+        # question two prior cycles already investigated and rejected.
+        #
+        # Measured directly (a real 8192-sample block from the middle of
+        # input_test.mp3 seconds 7-10, interpolated at the pinned baseline
+        # config's upscale_factor=7): REFUTED. perform_ist_iteration's own
+        # kept-bin mask (magnitude > 0.6 * the block's own FFT peak,
+        # DC excluded) is bit-for-bit identical between the very first
+        # pass and the second pass - the fixed point is reached
+        # immediately, exactly as the function's own "hard-threshold IST
+        # is a fixed-point projection" comment already claims - and of the
+        # handful of bins ever kept (6, out of thousands of possible HF
+        # bins), none sit at or above 2kHz. Running more passes (a larger
+        # max_iterations) cannot change either fact: the same fixed point
+        # would be reached with 2 passes as with 300. This independently
+        # confirms, via a mechanism (convergence dynamics) genuinely
+        # different from either prior cycle's investigation or this
+        # cycle's dominant-split test above, that the missing-HF-detail
+        # gap sits entirely in perform_ist_iteration's single hard
+        # peak-relative threshold decision itself, not in how many times
+        # it runs or in anything downstream of it.
+        if not os.path.exists(_INPUT_TEST_MP3):
+            self.skipTest("input_test.mp3 reference asset not present")
+
+        sample_rate, mp3_samples, _ = read_audio(_INPUT_TEST_MP3,
+                                                          format='mp3')
+        channel = mp3_samples[:, 0].astype(np.float32)
+        upscale_factor = 7
+        threshold = 0.6
+        start = 7 * sample_rate
+        n = 3 * sample_rate
+        self.assertLessEqual(start + n, len(channel),
+                             "input_test.mp3 shorter than expected - "
+                             "re-pick the slice window")
+        sig = channel[start:start + n]
+
+        expanded = new_interpolation_algorithm(sig, upscale_factor)
+        out_sr = sample_rate * upscale_factor
+        block_size = 8192
+        mid = len(expanded) // 2
+        block = expanded[mid:mid + block_size]
+
+        def kept_mask(data_thres):
+            data_fft = np.fft.fft(data_thres.astype(np.float64))
+            fft_peak = np.max(np.abs(data_fft))
+            mask = np.abs(data_fft) > threshold * fft_peak
+            mask[0] = False
+            return mask
+
+        data_thres = initialize_ist(block, threshold)
+        mask_pass0 = kept_mask(data_thres)
+        self.assertGreater(
+            int(mask_pass0.sum()), 0,
+            "this block should actually keep some content on this loud "
+            "real-material slice - fixture precondition")
+
+        next_data_thres = perform_ist_iteration(data_thres, threshold)
+        mask_pass1 = kept_mask(next_data_thres)
+
+        self.assertTrue(
+            np.array_equal(mask_pass0, mask_pass1),
+            "the kept-bin mask should already be at its fixed point after "
+            "the first refinement pass - if it keeps changing on later "
+            "passes, max_iterations could genuinely matter for HF "
+            "recovery and this investigation's conclusion needs "
+            "revisiting")
+
+        freqs = np.fft.fftfreq(block_size, d=1.0 / out_sr)
+        hf_kept = int(np.sum(mask_pass1 & (np.abs(freqs) >= 2000)))
+        self.assertEqual(
+            hf_kept, 0,
+            "no HF (>=2kHz) bins should ever be kept by this block's own "
+            "hard threshold - if they start being kept, the missing-HF-"
+            "detail gap may no longer be structural and this "
+            "investigation's conclusion needs revisiting")
 
     def test_iterative_soft_thresholding_chains_across_iterations(self):
         data = np.array([0.9, 0.1, -0.8, 0.05, 0.7, -0.2, 0.3, -0.6],
