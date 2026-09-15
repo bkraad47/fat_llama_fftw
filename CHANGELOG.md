@@ -2,6 +2,28 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.0.0] - 2026-09-15
+
+`iterate-fat-llama` run (2 fix cycles) porting the CUDA-accelerated sibling package's (`bkraad47/fat_llama`) `v-2.0.0` branch changes into this CPU/FFTW package, excluding anything CUDA-specific, per user request. Comparing that branch against its own `main` showed this package was already at parity or ahead on most of the sibling's algorithmic work (peak-relative IST thresholding, FFT DC-bin exclusion, convergence early-exit, and windowed-overlap-add block processing — this package's own WOLA already includes a DC-leak correction the sibling's does not); the one concrete gap was IST's peak-inflation cap.
+
+### Added
+
+- **Ported the sibling's frequency-selective, envelope-gated IST peak-inflation cap.** `_cap_ist_changes_to_baseline_peak` previously rescaled IST's entire per-channel contribution by one uniform scalar whenever it threatened to push the channel's peak above the pre-IST interpolated baseline — correct but blunt, since it shrank genuinely quiet/high-frequency detail IST had legitimately added by the same amount as the dominant band actually responsible for the overshoot. It now splits IST's own contribution in the FFT domain into a dominant component (the band responsible for the overshoot) and a residual component, rescales only the dominant one, and falls back to the old uniform-scalar method only if that isn't enough on its own. A new `_local_peak_envelope` helper further gates that correction so a genuinely quiet passage (e.g. a fade-in) doesn't have disproportionate energy "unmasked" by a fixed, whole-buffer correction.
+
+### Fixed
+
+- **Fixed a real regression the port above introduced on real audio, caught by measurement against real program material rather than synthetic unit fixtures.** The first version of the envelope gate scaled itself against the channel's single loudest instant, so it suppressed the peak correction through nearly an entire ordinary loud passage — not just the genuine quiet/onset regions it was meant to protect — since real music's own crest factor keeps a typical moment's local peak well below the track's single loudest instant almost everywhere. Measured impact: coherence 9.9 -> 7.0, spectral deviation 9.8 -> 9.2 (spectral convergence 0.9685 -> 0.8406), from a ~1.0-1.55dB low-frequency boost that the mandatory final normalize then paid for out of every other band. Fixed by gating the correction against a floor fraction of the channel's peak (a new `onset_gate_ratio` parameter, default `0.3`) instead of the raw peak itself, so the gate saturates open throughout ordinary loud material while still closing near genuine silence. Verified recovered: coherence 9.0, spectral deviation 9.8 (convergence 0.9575) — both within measurement noise of the pre-port baseline.
+
+### Investigated, no change made
+
+- Did not port the sibling's separately investigated `threshold_value=0.15` experiment — their own changelog logged it as increasing non-dominant-band detail on a synthetic signal but not holding up broadly, and left the default unchanged. This run made the same call.
+
+### Known remaining gaps
+
+- No IST-attributable added detail below the original Nyquist frequency was measured against a no-IST interpolation-only control this run — a long-standing gap, not something this port changed either way.
+- The envelope gate's quiet/loud asymmetry compresses short-time dynamic range by roughly 3.6dB relative to both the reference and a no-IST control (quiet passages keep IST's full uncapped contribution since the gate stays near zero there, while loud passages get the full correction) — a newly measured finding, not a regression from this run, and a good candidate for a future cycle.
+- `.claude/agents/rules/audio-quality.md`'s pinned baseline config still references `toggle_normalize`/`toggle_autoscale`/`toggle_adaptive_filter` kwargs and an `lms_filter`/~20-minute runtime estimate that don't match this package's actual `upscale()` signature or current (~3 second) runtime — a pre-existing gap outside this pipeline's write scope, previously flagged in 1.4.3/1.4.5.
+
 ## [1.4.5] - 2026-09-13
 
 Documentation-only pass reconciling README.md with the actual current pipeline in `feed.py` — no source or test changes.
