@@ -303,7 +303,7 @@ upscale(
 ### `TestFeed`
 **File:** fat_llama_fftw/tests/test_feed.py:37
 **Kind:** class
-**Description:** `unittest.TestCase` covering every function in `feed.py`, 62 test methods (+5 this cycle: direct unit coverage plus a real-material regression for the new `_limit_combined_peak_to_baseline` local peak trim — see below). Notable groups: I/O, interpolation, IST core, `_local_peak_envelope` (3 tests), `_local_rms_envelope` (4 tests), the peak cap (`_cap_ist_changes_to_baseline_peak` — 7 tests), `_limit_combined_peak_to_baseline` (3 direct + 2 wiring/real-material), 2 net-attenuation/boost-bound tests, the Nyquist cutoff, and full `upscale()` wiring/edge cases.
+**Description:** `unittest.TestCase` covering every function in `feed.py`, 64 test methods (+2 this cycle: permanent regression tests documenting a 6th/7th independent investigation of the added-detail-above-4kHz gap, both refuted — see below). Notable groups: I/O, interpolation, IST core, `_local_peak_envelope` (3 tests), `_local_rms_envelope` (4 tests), the peak cap (`_cap_ist_changes_to_baseline_peak` — 7 tests), `_limit_combined_peak_to_baseline` (3 direct + 2 wiring/real-material), 2 net-attenuation/boost-bound tests, the added-detail investigation regression tests (2), the Nyquist cutoff, and full `upscale()` wiring/edge cases.
 **Usage:**
 ```python
 python -m unittest discover -s fat_llama_fftw/tests
@@ -361,6 +361,18 @@ python -m unittest discover -s fat_llama_fftw/tests
 **File:** fat_llama_fftw/tests/test_feed.py:1483
 **Kind:** method (new this cycle)
 **Description:** Cycle-3 investigation regression test, companion to the one above. Proves on a real programme-material block that `perform_ist_iteration`'s kept-bin mask is bit-for-bit identical between pass 0 and pass 1 (i.e. the fixed point is reached in a single pass), and that 0 of thousands of possible bins `>=2kHz` are ever kept — so `max_iterations`/convergence behavior cannot recover HF content either, since none is ever selected in the first place.
+**Returns:** `None` (assertion-based).
+
+### `TestFeed.test_iterative_soft_thresholding_block_size_does_not_change_hf_correlation_with_reference(self)`
+**File:** fat_llama_fftw/tests/test_feed.py:1565
+**Kind:** method (new this cycle)
+**Description:** 6th independent investigation regression test (this iterate-fat-llama run's cycle 2, targeting the added-detail-above-4kHz gap with a genuinely new angle: block/WOLA size). Sweeps `iterative_soft_thresholding(..., block_size=X)` at `{2048, 8192, 32768}` through the full real pipeline tail against real `input_test.mp3`/`input_test.flac`; asserts per-band gain measurably shifts with `block_size` (proving the sweep isn't vacuous) while 8-19kHz envelope correlation with the lossless reference stays low (`<0.2`) at every size — block size is not the bottleneck either.
+**Returns:** `None` (assertion-based).
+
+### `TestFeed.test_iterative_soft_thresholding_noise_floor_relative_threshold_adds_noise_not_detail(self)`
+**File:** fat_llama_fftw/tests/test_feed.py:1675
+**Kind:** method (new this cycle)
+**Description:** 7th independent investigation regression test (this run's cycle 2, second new angle: a two-pass per-bin noise-floor-relative threshold, self-contained/never wired into production). Against real material, asserts this alternative mechanism measurably raises the 16-20kHz band (`>3dB`, proving it's a real effect) while its HF content's correlation with the lossless reference stays low (`<0.2`) — i.e. it indiscriminately amplifies noise rather than recovering genuine detail, the strongest evidence yet that the MP3 decoder's HF content sits at its own near-zero dequantization floor (~5.6e5x smaller than the LF floor) rather than being quiet-but-recoverable signal.
 **Returns:** `None` (assertion-based).
 
 ### `TestFeed.test_upscale_channels_caps_combined_peak_close_to_baseline_stereo(self)`

@@ -2,6 +2,23 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.0.2] - 2026-09-16
+
+`iterate-fat-llama` run (2 fix cycles) targeting a user-requested coherence improvement toward a 9.5 target. Coherence rose from 8.5 to 9.0; the remaining gap to 9.5 is now conclusively documented as unreachable within this project's DSP-only, no-synthesis constraint (see below).
+
+### Fixed
+
+- **Fixed a small but systematic 400-4000Hz mid-band attenuation**, found by real-material measurement against a plain-resample control (a deficit of -0.146 to -0.201dB, with 0-400Hz essentially unaffected). Root cause: the IST peak-inflation cap's own shrink loop is deliberately not fully converged, so a real track's combined (interpolated + IST) peak sits ~4.2-4.6% above its pre-IST baseline in a sparse handful of brief regions (well under 0.01% of samples) — but the mandatory final normalize divides the *entire* channel by that inflated peak, taxing every sample, including mid/high bands IST never touched, while low-frequency bands (which IST does boost) partly offset the same tax with their own gain. A global frequency-domain fix was tried and rejected (it drove the correction toward zero everywhere, reopening the "no added detail" gap this whole mechanism protects); the shipped fix instead trims only the rare local regions that actually exceed the baseline peak, reusing the existing local-peak-envelope machinery. Verified on real material: the mid-band deficit dropped to a worst case of -0.0075dB (roughly 20x smaller), while touching under 0.12% of samples and reducing IST's own added-detail content by under 2%. Coherence rose from 8.5 to 9.0; none of the fixes from 2.0.0/2.0.1 (quiet-passage elevation, digital-silence lead-in, fade-in near-cancellation, the WOLA hop investigation) were reopened.
+
+### Investigated, no change made
+
+- **Made two more independent attempts at genuine IST-attributable added detail above 4kHz — and found the strongest evidence yet for why it can't be done within this project's constraints.** This brings the total to 7 independent investigations of this gap across 3 `iterate-fat-llama` runs. This run tried two mechanism classes not covered by the prior 4: varying the IST block/WOLA size (measurably changes gain, but correlation with the lossless reference stays flat regardless of size — it isn't a resolution problem), and a two-pass per-bin noise-floor-relative threshold (never wired into production — tested standalone) that revealed the actual reason no threshold-based approach can work: the MP3 decoder's own high-frequency content sits roughly 500,000x below the low-frequency floor across virtually the entire HF range, meaning it isn't a quiet-but-recoverable signal — it's simply gone. A relative threshold either finds nothing there to keep, or (as the noise-floor variant demonstrated) keeps everything indiscriminately and amplifies noise uniformly, uncorrelated with the reference either way. Recovering that content for real would require synthesizing it, which this project's own hard constraint against AI/ML and non-DSP synthesis rules out. Two new permanent regression tests document both investigations directly against real audio.
+
+### Known remaining gaps
+
+- **Coherence is capped at 9 (not 9.5) by the added-detail gap above, and this is now a structural ceiling, not a tuning problem.** Per this project's own audio-quality scoring rubric, a score above 9 requires measurable added detail in previously-missing/congested bands below the original Nyquist frequency; after 7 independent, real-measurement investigations across every mechanism class this project's DSP-only constraint permits, none has found any. Reaching 9.5 would require synthesizing content that was never in the source — out of scope for this project by design, not an oversight.
+- `.claude/agents/rules/audio-quality.md`'s pinned baseline config still references stale `toggle_*` kwargs and a since-removed LMS-filter runtime estimate that don't match this package's actual `upscale()` signature or current (~4-5 second) runtime, and its baseline numbers no longer match `example.py`'s — flagged again this run (4th consecutive run to flag it). This file is under `.claude/`, which no automated skill or agent in this project is permitted to edit — it needs a direct human edit.
+
 ## [2.0.1] - 2026-09-15
 
 `iterate-fat-llama` run (3 fix cycles) addressing the "Known remaining gaps" left open by 2.0.0: the envelope gate's quiet/loud dynamic-range asymmetry, and (as a final, conclusive investigation rather than a code change) the long-standing no-added-detail-below-Nyquist gap.
