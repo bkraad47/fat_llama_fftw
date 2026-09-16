@@ -11,6 +11,9 @@ from fat_llama_fftw.audio_fattener.feed import (
     iterative_soft_thresholding,
     upscale_channels,
     _cap_ist_changes_to_baseline_peak,
+    _limit_combined_peak_to_baseline,
+    _local_peak_envelope,
+    _local_rms_envelope,
     _fft_thread_count,
     _MULTI_THREAD_FFT_MIN_SAMPLES,
     normalize_signal,
@@ -30,6 +33,7 @@ import fat_llama_fftw.audio_fattener.feed as feed_module
 _REPO_ROOT = os.path.abspath(
     os.path.join(os.path.dirname(__file__), '..', '..'))
 _INPUT_TEST_MP3 = os.path.join(_REPO_ROOT, 'input_test.mp3')
+_INPUT_TEST_FLAC = os.path.join(_REPO_ROOT, 'input_test.flac')
 
 class TestFeed(unittest.TestCase):
 
@@ -504,6 +508,124 @@ class TestFeed(unittest.TestCase):
         expected = new_interpolation_algorithm(channel, 2)[:, np.newaxis]
         np.testing.assert_allclose(output, expected, atol=1e-6)
 
+    def test_local_peak_envelope_empty_signal(self):
+        # Coverage-gap fix flagged by audio-quality-checker: _local_peak_
+        # envelope was imported but never directly exercised anywhere in
+        # this file (only indirectly, through
+        # _cap_ist_changes_to_baseline_peak's own call site) - these three
+        # tests give it direct unit coverage. Empty input must short-
+        # circuit to an empty array (matching iterative_soft_thresholding's
+        # own division-by-zero-avoiding empty-input handling elsewhere in
+        # this module), not raise on an empty np.max.
+        result = _local_peak_envelope(np.array([], dtype=np.float32))
+        self.assertEqual(len(result), 0)
+
+    def test_local_peak_envelope_short_signal_returns_constant_peak(self):
+        # For len(signal) <= block_size, the function's own docstring says
+        # it returns a constant array at the signal's own overall peak -
+        # there is only one analysis window's worth of data, so there is
+        # nothing to vary across.
+        signal = np.array([0.1, -0.5, 0.3, -0.2], dtype=np.float32)
+        envelope = _local_peak_envelope(signal, block_size=8192)
+        self.assertEqual(len(envelope), len(signal))
+        np.testing.assert_allclose(envelope, np.full(4, 0.5), atol=1e-6)
+
+    def test_local_peak_envelope_tracks_loud_and_quiet_regions(self):
+        # For a signal longer than block_size, the envelope must track
+        # each region's own local peak (this is the whole premise
+        # _cap_ist_changes_to_baseline_peak's envelope gate relies on -
+        # see this cycle's own fix there): a loud region's envelope should
+        # sit near that region's own peak, a quiet region's envelope near
+        # its own (much lower) peak, with the WOLA reconstruction keeping
+        # the envelope non-negative and correctly shaped (not, e.g.,
+        # inverted or off-by-a-block).
+        block_size = 512
+        n = 4096
+        signal = np.zeros(n, dtype=np.float32)
+        signal[:n // 2] = 1.0
+        signal[n // 2:] = 0.05
+        envelope = _local_peak_envelope(signal, block_size=block_size)
+
+        self.assertEqual(len(envelope), n)
+        self.assertTrue(np.all(envelope >= 0))
+        # Well inside the loud region (away from the transition's own
+        # blending), the envelope should sit at essentially the loud
+        # region's own peak (1.0); well inside the quiet region, at
+        # essentially the quiet region's own peak (0.05) - not some
+        # blended/averaged value from the other region.
+        np.testing.assert_allclose(envelope[:100], 1.0, atol=1e-3)
+        np.testing.assert_allclose(envelope[-100:], 0.05, atol=1e-3)
+        # And the loud region's envelope must be materially higher than
+        # the quiet region's - the core property the peak-cap's gate
+        # depends on to actually distinguish the two.
+        self.assertGreater(np.min(envelope[:100]), 10 * np.max(envelope[-100:]))
+
+    def test_local_rms_envelope_empty_signal(self):
+        # New this cycle - direct unit coverage for _local_rms_envelope,
+        # the RMS-based counterpart of _local_peak_envelope now used by
+        # _cap_ist_changes_to_baseline_peak's "does the dominant-band
+        # correction help or hurt here" gate (see that function's own
+        # docstring for why RMS, not peak). Same empty-input contract as
+        # _local_peak_envelope.
+        result = _local_rms_envelope(np.array([], dtype=np.float32))
+        self.assertEqual(len(result), 0)
+
+    def test_local_rms_envelope_short_signal_returns_constant_rms(self):
+        # For len(signal) <= block_size, returns a constant array at the
+        # signal's own overall RMS (not peak) - there is only one analysis
+        # window's worth of data.
+        signal = np.array([1.0, -1.0, 1.0, -1.0], dtype=np.float32)
+        envelope = _local_rms_envelope(signal, block_size=8192)
+        self.assertEqual(len(envelope), len(signal))
+        np.testing.assert_allclose(envelope, np.full(4, 1.0), atol=1e-6)
+
+    def test_local_rms_envelope_tracks_loud_and_quiet_regions(self):
+        # Same premise as test_local_peak_envelope_tracks_loud_and_quiet_
+        # regions above, but for RMS: a loud region's envelope should sit
+        # near that region's own RMS, a quiet region's near its own (much
+        # lower) RMS, and the loud region must be materially higher than
+        # the quiet one - the property _cap_ist_changes_to_baseline_peak's
+        # gate now depends on. Unlike the peak-based version, RMS blends
+        # over the FRACTION of an analysis window that is loud vs silent
+        # (not just whether the window touches any loud sample at all), so
+        # a window straddling the very first/last edge of the signal (part
+        # real data, part the WOLA's own zero-padding) or the loud/quiet
+        # transition reads as an intermediate value, not the pure regional
+        # RMS - this samples well inside each region, away from both the
+        # signal's own edges and the transition, where every overlapping
+        # analysis window sits entirely inside one region.
+        block_size = 512
+        n = 4096
+        signal = np.zeros(n, dtype=np.float32)
+        signal[:n // 2] = 1.0
+        signal[n // 2:] = 0.05
+        envelope = _local_rms_envelope(signal, block_size=block_size)
+
+        self.assertEqual(len(envelope), n)
+        self.assertTrue(np.all(envelope >= 0))
+        loud_interior = envelope[block_size:block_size + 100]
+        quiet_interior = envelope[n - block_size - 100:n - block_size]
+        np.testing.assert_allclose(loud_interior, 1.0, atol=1e-3)
+        np.testing.assert_allclose(quiet_interior, 0.05, atol=1e-3)
+        self.assertGreater(np.min(loud_interior), 10 * np.max(quiet_interior))
+
+    def test_local_rms_envelope_differs_from_peak_envelope_on_bursty_signal(
+            self):
+        # Direct evidence for the RMS-vs-peak distinction this cycle's fix
+        # relies on: a block that is mostly silent but has one brief loud
+        # burst has a peak envelope dominated by that single burst, but an
+        # RMS envelope that stays low (since RMS integrates over the whole
+        # block, not just its single loudest sample) - the two must
+        # measurably disagree here, confirming they are not interchangeable
+        # proxies for "how loud is this region".
+        block_size = 2048
+        n = 4096
+        signal = np.zeros(n, dtype=np.float32)
+        signal[100:110] = 1.0  # a brief burst inside an otherwise-silent block
+        peak_env = _local_peak_envelope(signal, block_size=block_size)
+        rms_env = _local_rms_envelope(signal, block_size=block_size)
+        self.assertGreater(peak_env[0], 5 * rms_env[0])
+
     def test_cap_ist_changes_to_baseline_peak_noop_when_not_needed(self):
         # If adding ist_changes onto expanded_channel does not grow the
         # peak beyond expanded_channel's own peak, nothing should be
@@ -563,6 +685,84 @@ class TestFeed(unittest.TestCase):
         self.assertGreater(float(np.max(np.abs(capped))),
                            0.01 * float(np.max(np.abs(ist_changes))))
 
+    def test_cap_ist_changes_to_baseline_peak_preserves_quiet_band(self):
+        # New this cycle - regression test for the frequency-selective
+        # dominant/residual split ported from the CUDA sibling repo's own
+        # v-2.0.0 (translated cupy -> numpy/pyfftw here): the previous fix
+        # (a whole-signal uniform-scalar shrink) bounded the combined peak
+        # by shrinking ALL of ist_changes by the same ratio, even though
+        # only the loud, low-frequency component actually caused the
+        # overshoot - suppressing IST's genuinely-added quiet/high-
+        # frequency detail nearly as much as the dominant band responsible
+        # for it. This fixture isolates that: ist_changes carries a loud
+        # low-frequency tone (the overshoot cause) plus a much quieter
+        # high-frequency tone (genuinely-added detail, well below
+        # dominant_band_ratio's default 0.002 of the spectrum's own peak
+        # magnitude) landing exactly on an FFT bin (n=4410 at 44100Hz gives
+        # exactly 10Hz/bin, so both 200Hz and 15000Hz land on-bin with no
+        # spectral leakage to confound the measurement). The quiet tone's
+        # own FFT magnitude must survive essentially untouched (>90%)
+        # while the combined peak is still bounded close to baseline -
+        # verifying the split leaves the residual component alone rather
+        # than just reducing the old shrink's collateral damage.
+        n = 4410
+        sample_rate = 44100
+        t = np.arange(n) / sample_rate
+        low_freq, high_freq = 200.0, 15000.0
+
+        expanded = (0.8 * np.sin(2 * np.pi * low_freq * t)).astype(np.float32)
+        ist_changes = (
+            1.0 * np.sin(2 * np.pi * low_freq * t)
+            + 0.0005 * np.sin(2 * np.pi * high_freq * t)
+        ).astype(np.float32)
+
+        baseline_peak = float(np.max(np.abs(expanded)))
+        uncapped_peak = float(np.max(np.abs(expanded + ist_changes)))
+        self.assertGreater(
+            uncapped_peak, baseline_peak,
+            "fixture must actually overshoot to exercise the cap")
+
+        def high_band_mag(signal):
+            spec = np.abs(np.fft.rfft(np.asarray(signal, dtype=np.float64)))
+            freqs = np.fft.rfftfreq(n, d=1.0 / sample_rate)
+            idx = int(np.argmin(np.abs(freqs - high_freq)))
+            return float(spec[idx])
+
+        pre_mag = high_band_mag(ist_changes)
+        capped = _cap_ist_changes_to_baseline_peak(expanded, ist_changes)
+        post_mag = high_band_mag(capped)
+
+        self.assertGreater(
+            post_mag, 0.9 * pre_mag,
+            "quiet high-frequency band should survive the cap essentially "
+            "untouched, not be shrunk along with the dominant band")
+
+        combined_peak = float(np.max(np.abs(expanded + capped)))
+        self.assertLess(combined_peak, baseline_peak * 1.2)
+
+    def test_cap_ist_changes_to_baseline_peak_pathological_ratio_falls_back(
+            self):
+        # New this cycle - a dominant_band_ratio so high (1.5, meaning a
+        # bin would need to exceed 150% of the spectrum's own peak
+        # magnitude to be classified "dominant") that nothing is ever
+        # classified as dominant. The frequency-selective split alone
+        # cannot bound the peak in that case (there is nothing to shrink),
+        # so the safety-net whole-signal uniform-shrink fallback (the
+        # pre-existing method, unchanged) must still engage and bound the
+        # combined peak at least as well as the old uniform-shrink-only
+        # implementation did.
+        expanded = np.array([10.0, 10.0, -10.0, -10.0], dtype=np.float32)
+        ist_changes = np.array([15.0, 15.0, -15.0, -15.0], dtype=np.float32)
+        baseline_peak = float(np.max(np.abs(expanded)))
+
+        capped = _cap_ist_changes_to_baseline_peak(
+            expanded, ist_changes, dominant_band_ratio=1.5)
+        combined_peak = float(np.max(np.abs(expanded + capped)))
+
+        self.assertLess(combined_peak, baseline_peak * 1.1)
+        self.assertGreater(float(np.max(np.abs(capped))),
+                           0.01 * float(np.max(np.abs(ist_changes))))
+
     def test_cap_ist_changes_to_baseline_peak_zero_baseline(self):
         # Guards the baseline_peak == 0 short-circuit - dividing by a zero
         # baseline peak would be a degenerate no-op cap rather than an
@@ -571,6 +771,215 @@ class TestFeed(unittest.TestCase):
         ist_changes = np.array([1.0, -1.0, 2.0, -2.0], dtype=np.float32)
         result = _cap_ist_changes_to_baseline_peak(expanded, ist_changes)
         np.testing.assert_allclose(result, ist_changes, atol=1e-6)
+
+    def test_cap_ist_changes_to_baseline_peak_envelope_gates_quiet_onset(
+            self):
+        # New this cycle - regression test for the envelope-gated fix
+        # ported from the CUDA sibling repo's v-2.0.0: applying the
+        # frequency-selective dominant/residual split's fixed scalar
+        # correction uniformly across a non-stationary buffer breaks a
+        # near-exact dominant/residual cancellation that (uncapped)
+        # reconstructs a real quiet onset - "unmasking" energy specifically
+        # where the signal is quietest. Uses a broadband (multi-tone),
+        # raised-cosine fade-in synthetic channel (silence-adjacent, not
+        # exactly zero, per the directive) run through the REAL
+        # new_interpolation_algorithm -> iterative_soft_thresholding ->
+        # _cap_ist_changes_to_baseline_peak pipeline (long enough - 1.5s at
+        # 44100Hz, > block_size after upscaling - to exercise the blocked
+        # WOLA path, not just a short whole-signal chain).
+        #
+        # Directly confirmed via a monkeypatched experiment (not shipped,
+        # only used to validate this test's own premise) that disabling
+        # gating (forcing gate=1 everywhere, i.e. the ungated frequency-
+        # selective split alone) reproduces the regression on this exact
+        # fixture: +6.4dB onset-window RMS elevation vs. the pre-IST
+        # interpolation-only baseline's own RMS in that same window.
+        #
+        # Superseding note (this cycle): the gate mechanism itself changed
+        # (onset_gate_ratio's fixed global-peak-relative ratio -> a
+        # data-driven local "does the correction help or hurt here" gate
+        # based on _local_rms_envelope - see _cap_ist_changes_to_baseline_
+        # peak's own docstring for the full real-material finding that
+        # motivated this and why the old design could not tell a genuine
+        # near-cancelling onset like this fixture apart from an ordinary
+        # quiet passage with real, uncancelled excess). With the new gate,
+        # this fixture measures ~+0.42dB onset-window elevation (vs.
+        # onset_gate_ratio's own ~+0.1dB) - still a large margin under the
+        # 3dB bound below and nowhere near the ungated +6.4dB failure, so
+        # this remains a real regression guard for onset/fade-in
+        # protection specifically, now verified against the new mechanism
+        # rather than the old one.
+        sample_rate = 44100
+        duration = 1.5
+        n = int(sample_rate * duration)
+        t = np.arange(n) / sample_rate
+
+        fade_len = int(0.3 * sample_rate)
+        envelope_shape = np.ones(n)
+        ramp = 0.5 - 0.5 * np.cos(np.pi * np.arange(fade_len) / fade_len)
+        floor = 0.02  # silence-adjacent, not exactly zero
+        envelope_shape[:fade_len] = floor + (1 - floor) * ramp
+
+        freqs = [300.0, 1200.0, 3000.0, 7000.0]
+        sig = np.zeros(n)
+        for f in freqs:
+            sig += np.sin(2 * np.pi * f * t)
+        sig = sig / np.max(np.abs(sig))
+        sig = (sig * envelope_shape).astype(np.float32)
+
+        upscale_factor = 2
+        expanded = new_interpolation_algorithm(sig, upscale_factor)
+        ist_changes = iterative_soft_thresholding(expanded, max_iter=100,
+                                                  threshold=0.6)
+        capped = _cap_ist_changes_to_baseline_peak(expanded, ist_changes)
+
+        onset = 1024
+        rms_before = float(np.sqrt(np.mean(
+            expanded[:onset].astype(np.float64) ** 2)))
+        combined = expanded.astype(np.float32) + capped
+        rms_after = float(np.sqrt(np.mean(
+            combined[:onset].astype(np.float64) ** 2)))
+
+        db_elevation = 20 * np.log10(rms_after / max(rms_before, 1e-12))
+        self.assertLess(
+            db_elevation, 3.0,
+            "onset-window RMS should not be materially elevated by the "
+            "dominant-band correction - it was never responsible for the "
+            "peak overshoot the cap exists to bound")
+
+    def test_cap_ist_changes_to_baseline_peak_does_not_elevate_quiet_real_material(
+            self):
+        # Direct regression test for audio-quality-checker's real-material
+        # quiet-passage findings. Uses the real new_interpolation_algorithm
+        # -> iterative_soft_thresholding -> _cap_ist_changes_to_baseline_peak
+        # pipeline at the pinned baseline config (upscale_factor=7,
+        # max_iterations=300, threshold_value=0.6) against real slices of
+        # input_test.mp3, and checks broadband RMS elevation relative to a
+        # no-IST interpolation-only control stays under a bound. Two cases,
+        # covering two different findings against two different regions of
+        # the same file (see each case's own comment below) - both must be
+        # processed as part of a properly long, block-WOLA-processed slice
+        # (not in isolation) since both findings are about how the pipeline
+        # behaves at specific points within a longer signal, not about a
+        # short clip's own edge effects.
+        if not os.path.exists(_INPUT_TEST_MP3):
+            self.skipTest("input_test.mp3 reference asset not present")
+
+        sample_rate, samples, bitrate = read_audio(_INPUT_TEST_MP3,
+                                                           format='mp3')
+        channel = samples[:, 0].astype(np.float32)
+        upscale_factor = 7
+        max_iter = 300
+        threshold = 0.6
+        out_sr = sample_rate * upscale_factor
+
+        cases = [
+            # Original cycle-1 finding: onset_gate_ratio's fixed global-
+            # peak-relative gate withheld the dominant-band correction not
+            # just at genuine near-cancelling onsets (the synthetic fixture
+            # above) but at ANY region whose local envelope sat below its
+            # floor relative to the channel's own peak - including ordinary
+            # quiet real-material passages with no cancellation to protect,
+            # leaving them elevated relative to a no-IST control. Measured
+            # directly: the OLD (onset_gate_ratio) design left this window
+            # ~+2.3 to +2.4dB elevated; the NEW (local RMS-envelope helps-
+            # or-hurts) design measures ~+0.24 to +0.29dB there.
+            dict(label="ordinary quiet passage (0.5-1.0s)",
+                 proc_start=0.5, proc_len=0.5,
+                 measure_start=0.0, measure_end=0.5,
+                 bound_db=1.5),
+            # This cycle's finding (audio-quality-checker, after the fix
+            # above shipped): a residual elevation confined to the track's
+            # very first frames - its genuine digital-silence lead-in
+            # (source samples there measure ~1e-13, effectively exact
+            # silence, confirmed by direct inspection - not just quiet).
+            # Processes a slice starting at the true beginning of the file
+            # (so the WOLA-blocked pipeline sees a real "start of signal"
+            # boundary, not an isolated short clip) but measures elevation
+            # only within the first 0.02s of the OUTPUT - the exact-silence
+            # portion where the residual actually concentrates (see
+            # _cap_ist_changes_to_baseline_peak's own silence_gate comment
+            # for the direct measurement this bound is based on: ~+3.7dB
+            # before that fix, ~+0.17dB after).
+            dict(label="genuine digital-silence lead-in (0.0-0.02s)",
+                 proc_start=0.0, proc_len=0.5,
+                 measure_start=0.0, measure_end=0.02,
+                 bound_db=1.0),
+        ]
+
+        for case in cases:
+            with self.subTest(case["label"]):
+                start = int(case["proc_start"] * sample_rate)
+                n = int(case["proc_len"] * sample_rate)
+                self.assertLessEqual(
+                    start + n, len(channel),
+                    "input_test.mp3 shorter than expected - re-pick the "
+                    "slice window")
+                sig = channel[start:start + n]
+
+                expanded = new_interpolation_algorithm(sig, upscale_factor)
+                ist_changes = iterative_soft_thresholding(
+                    expanded, max_iter, threshold)
+                capped = _cap_ist_changes_to_baseline_peak(
+                    expanded, ist_changes)
+                combined = expanded.astype(np.float32) + capped
+
+                m0 = int(case["measure_start"] * out_sr)
+                m1 = int(case["measure_end"] * out_sr)
+                expanded_slice = expanded[m0:m1].astype(np.float64)
+                combined_slice = combined[m0:m1].astype(np.float64)
+
+                baseline_rms = float(np.sqrt(np.mean(expanded_slice ** 2)))
+                combined_rms = float(np.sqrt(np.mean(combined_slice ** 2)))
+                self.assertGreater(baseline_rms, 0,
+                                   "fixture measurement window must not be "
+                                   "silent in the interpolation baseline "
+                                   "itself")
+
+                elevation_db = 20 * np.log10(combined_rms / baseline_rms)
+                self.assertLess(
+                    elevation_db, case["bound_db"],
+                    f"{case['label']} should not be measurably elevated "
+                    "relative to a no-IST/interpolation-only baseline")
+
+    def test_upscale_channels_caps_combined_peak_close_to_baseline_stereo(
+            self):
+        # New this cycle - end-to-end wiring check that upscale_channels
+        # itself (not just _cap_ist_changes_to_baseline_peak in isolation)
+        # keeps each channel's combined (interpolation + IST) peak close to
+        # its own pre-IST interpolation baseline, for a genuinely
+        # multi-channel (stereo) input - closes the gap that the isolated
+        # helper tests above never exercise the real call site's own
+        # per-channel wiring (_process_channel) or thread-pool dispatch
+        # path.
+        sample_rate = 44100
+        duration = 0.2
+        n = int(sample_rate * duration)
+        t = np.arange(n) / sample_rate
+        left = (10000.0 * np.sin(2 * np.pi * 220.0 * t)
+               + 500.0 * np.sin(2 * np.pi * 9000.0 * t)).astype(np.float32)
+        right = (8000.0 * np.sin(2 * np.pi * 330.0 * t)
+                + 400.0 * np.sin(2 * np.pi * 11000.0 * t)).astype(np.float32)
+        channels = np.column_stack([left, right])
+
+        upscale_factor = 3
+        max_iter = 100
+        threshold = 0.6
+
+        result = upscale_channels(channels, upscale_factor, max_iter,
+                                  threshold)
+
+        for i, channel in enumerate([left, right]):
+            baseline = new_interpolation_algorithm(channel, upscale_factor)
+            baseline_peak = float(np.max(np.abs(baseline)))
+            combined_peak = float(np.max(np.abs(result[:, i])))
+            # Bounded shrink, not exact convergence (see
+            # _cap_ist_changes_to_baseline_peak's own docstring) - allow
+            # some headroom above baseline_peak while still confirming the
+            # cap materially bounds growth, not just a token amount.
+            self.assertLess(combined_peak, baseline_peak * 1.25,
+                            f"channel {i} combined peak not bounded close "
+                            "to its own pre-IST interpolation baseline")
 
     def test_upscale_channels_ist_does_not_net_attenuate_untouched_band(self):
         # Direct regression test for this cycle's highest-priority finding
@@ -650,6 +1059,24 @@ class TestFeed(unittest.TestCase):
         lf_ratio_db = 20 * np.log10(
             band_mag(final_ist, lf_freq) / band_mag(final_ctrl, lf_freq))
         self.assertGreater(lf_ratio_db, -1.0)
+        # Coverage-gap fix flagged by audio-quality-checker: an envelope-
+        # gating regression (this cycle's own fix target - an overly broad
+        # gate that suppressed the peak-cap's correction almost everywhere
+        # on real material, not just genuine quiet onsets) showed up as an
+        # LF *boost*, not an attenuation - nothing here previously bounded
+        # that direction, so a whole class of regression could pass this
+        # suite while still failing audio-quality-checker. This fixture's
+        # own single sustained low tone does not by itself discriminate
+        # the two gate designs (its envelope is ~constant near the
+        # channel's own peak throughout, so both saturate to the same
+        # result here - measured identical -0.0996dB either way), but the
+        # bound is still real defensive coverage: a materially different
+        # (much larger) boost mechanism would still trip it. See
+        # test_upscale_channels_ist_does_not_net_attenuate_real_material's
+        # own low_band_ratio_db check below for the fixture that actually
+        # discriminates the two gate designs on real, non-stationary
+        # material.
+        self.assertLess(lf_ratio_db, 1.0)
 
     def test_upscale_channels_ist_does_not_net_attenuate_real_material(self):
         # Coverage-gap regression test flagged by audio-quality-checker this
@@ -738,6 +1165,635 @@ class TestFeed(unittest.TestCase):
         # slice/config, while still catching a regression back toward the
         # pre-max_rounds=20-tuning ~-1.0 to -1.24dB level or worse.
         self.assertGreater(hs_ratio_db, -1.0)
+
+        # Coverage-gap fix flagged by audio-quality-checker (this cycle):
+        # the envelope-gate regression this cycle fixes (gating the peak
+        # cap's dominant-band correction purely relative to the channel's
+        # single loudest instant, rather than to a floor closer to
+        # "typical" loudness - see _cap_ist_changes_to_baseline_peak's own
+        # comment) showed up on exactly this real slice as a low-band
+        # *boost* (ist_changes retaining far more of its own uncapped peak
+        # than intended), not an attenuation - the pre-existing
+        # attenuation-only bound above (hs_ratio_db > -1.0) stayed green
+        # throughout that regression, since a boost in one band and an
+        # attenuation elsewhere from the same mandatory final normalize
+        # are two sides of the same bug. Directly reproduced by
+        # temporarily reverting the gate to that broken design (measured
+        # here): low_band_ratio_db went from +0.023dB (this fix) to
+        # +1.217dB (broken) on this exact slice/config - a materially
+        # different, clearly distinguishable result, unlike the synthetic
+        # fixture in test_upscale_channels_ist_does_not_net_attenuate_
+        # untouched_band above (whose near-constant-envelope tone does not
+        # discriminate the two gate designs). 0.5dB sits with real margin
+        # above the fixed measurement and well below the broken one.
+        def low_band_mag(x):
+            spec = np.abs(np.fft.rfft(x.astype(np.float64)))
+            freqs = np.fft.rfftfreq(len(x), d=1.0 / new_sample_rate)
+            mask = (freqs >= 20) & (freqs < 300)
+            self.assertTrue(mask.any())
+            return float(np.sqrt(np.mean(spec[mask] ** 2)))
+
+        lb_ctrl_mag = low_band_mag(final_ctrl)
+        self.assertGreater(lb_ctrl_mag, 0)
+        lb_ratio_db = 20 * np.log10(low_band_mag(final_ist) / lb_ctrl_mag)
+        self.assertLess(lb_ratio_db, 0.5)
+
+    def test_limit_combined_peak_to_baseline_passes_through_when_not_needed(
+            self):
+        # _limit_combined_peak_to_baseline's gain is exactly 1.0 (bit-
+        # identical passthrough) everywhere the local envelope does not
+        # exceed baseline_peak - it must not touch a signal that never
+        # overshoots at all.
+        combined = np.array([1.0, -1.0, 0.5, -0.5, 0.9, -0.9],
+                            dtype=np.float32)
+        baseline_peak = 1.0
+        result = _limit_combined_peak_to_baseline(combined, baseline_peak,
+                                                   block_size=4)
+        np.testing.assert_array_equal(result, combined)
+
+    def test_limit_combined_peak_to_baseline_zero_baseline_passthrough(self):
+        # Guards the baseline_peak <= 0 short-circuit, mirroring
+        # _cap_ist_changes_to_baseline_peak's own zero-baseline guard.
+        combined = np.array([1.0, -1.0, 2.0], dtype=np.float32)
+        result = _limit_combined_peak_to_baseline(combined, 0.0)
+        np.testing.assert_array_equal(result, combined)
+
+    def test_limit_combined_peak_to_baseline_bounds_a_brief_spike(self):
+        # Regression test for this cycle's fix: a signal that is otherwise
+        # exactly at baseline_peak, but has one brief localized spike well
+        # above it (mirroring the sparse, few-sample overshoot
+        # _cap_ist_changes_to_baseline_peak's bounded shrink loop measurably
+        # leaves behind on real material - see this function's own
+        # docstring), must have that spike's local region brought back down
+        # to baseline_peak, while samples far from the spike (outside the
+        # WOLA block's own influence) are left materially unchanged.
+        n = 4096
+        block_size = 256
+        rng = np.random.default_rng(0)
+        combined = (0.5 * np.sin(
+            2 * np.pi * 5 * np.arange(n) / n)).astype(np.float32)
+        baseline_peak = 0.5
+        spike_idx = n // 2
+        combined[spike_idx] = 0.5 * 1.5  # 50% above baseline_peak locally
+
+        result = _limit_combined_peak_to_baseline(combined, baseline_peak,
+                                                   block_size=block_size)
+        self.assertLessEqual(float(np.max(np.abs(result))),
+                             baseline_peak * 1.001)
+        # Far from the spike (several blocks away), the WOLA envelope's own
+        # influence has decayed and gain should be back to (near) 1.0 - the
+        # fix must not globally shrink the whole signal to bound one local
+        # spike.
+        far = spike_idx + 4 * block_size
+        if far < n:
+            np.testing.assert_allclose(result[far], combined[far],
+                                       atol=1e-4)
+
+    def test_process_channel_wires_peak_limit_after_cap(self):
+        # End-to-end wiring check that _process_channel's own combined
+        # (interpolation + capped IST) output never exceeds its pre-IST
+        # interpolation baseline peak by more than a tight numerical
+        # tolerance - closing the gap the pre-existing, looser
+        # (baseline_peak * 1.25) test_upscale_channels_caps_combined_peak_
+        # close_to_baseline_stereo bound above does not: that bound only
+        # confirms _cap_ist_changes_to_baseline_peak's own (deliberately
+        # not-fully-converged) shrink loop, whereas this one confirms the
+        # new local peak-limit stage this cycle added on top of it actually
+        # runs as part of the real _process_channel/upscale_channels call
+        # path, not just in isolation.
+        sample_rate = 44100
+        duration = 0.3
+        n = int(sample_rate * duration)
+        t = np.arange(n) / sample_rate
+        sig = (9000.0 * np.sin(2 * np.pi * 180.0 * t)
+              + 300.0 * np.sin(2 * np.pi * 6500.0 * t)).astype(np.float32)
+        channels = sig[:, np.newaxis]
+
+        result = upscale_channels(channels, upscale_factor=3, max_iter=200,
+                                  threshold=0.6)
+
+        baseline = new_interpolation_algorithm(sig, 3)
+        baseline_peak = float(np.max(np.abs(baseline)))
+        combined_peak = float(np.max(np.abs(result[:, 0])))
+        self.assertLessEqual(combined_peak, baseline_peak * 1.01)
+
+    def test_upscale_channels_does_not_net_attenuate_mid_band_real_material(
+            self):
+        # Direct regression test for this cycle's fix: audio-quality-
+        # checker's test_no_net_band_attenuation_vs_resample_control found
+        # a systematic 400-4000Hz deficit (-0.146 to -0.201dB) vs. a plain
+        # bandlimited-resample (no-IST) control, root-caused to
+        # _cap_ist_changes_to_baseline_peak's own bounded shrink loop
+        # leaving a small (~4.2-4.6%) residual peak excess that upscale()'s
+        # mandatory final per-channel normalize then "spends" uniformly
+        # across every band, including ones IST never boosted - see
+        # _limit_combined_peak_to_baseline's own docstring for the full
+        # measurement. Same real slice/pinned-config methodology as
+        # test_upscale_channels_ist_does_not_net_attenuate_real_material
+        # above (seconds 7-10 of input_test.mp3, upscale_factor=7,
+        # max_iterations=300, threshold_value=0.6), but scoped to the
+        # specific 400-4000Hz band the finding measured, not the broader
+        # 2kHz-Nyquist "high-shelf" aggregate the sibling test already
+        # covers. Measured directly with this cycle's fix in place: this
+        # band now lands at +0.01 to +0.07dB (net-positive, not attenuated)
+        # instead of the pre-fix deficit.
+        if not os.path.exists(_INPUT_TEST_MP3):
+            self.skipTest("input_test.mp3 reference asset not present")
+
+        sample_rate, samples, bitrate = read_audio(_INPUT_TEST_MP3,
+                                                           format='mp3')
+        channel = samples[:, 0].astype(np.float32)
+        start = 7 * sample_rate
+        n = 3 * sample_rate
+        self.assertLessEqual(start + n, len(channel),
+                             "input_test.mp3 shorter than expected - "
+                             "re-pick the slice window")
+        sig = channel[start:start + n]
+
+        channels = sig[:, np.newaxis]
+        upscale_factor = 7
+        max_iter = 300
+        threshold = 0.6
+
+        ist_out = upscale_channels(channels, upscale_factor, max_iter,
+                                   threshold)[:, 0]
+        interp_only = new_interpolation_algorithm(sig, upscale_factor)
+
+        new_sample_rate = sample_rate * upscale_factor
+        original_nyquist = sample_rate / 2.0
+        orig_peak = float(np.max(np.abs(sig)))
+
+        def tail(x):
+            scaled = normalize_signal(x) * orig_peak
+            filtered = apply_nyquist_cutoff(scaled, new_sample_rate,
+                                            original_nyquist)
+            return normalize_signal(filtered)
+
+        final_ist = tail(ist_out)
+        final_ctrl = tail(interp_only)
+
+        def mid_band_mag(x):
+            spec = np.abs(np.fft.rfft(x.astype(np.float64)))
+            freqs = np.fft.rfftfreq(len(x), d=1.0 / new_sample_rate)
+            mask = (freqs >= 400) & (freqs < 4000)
+            self.assertTrue(mask.any())
+            return float(np.sqrt(np.mean(spec[mask] ** 2)))
+
+        ctrl_mag = mid_band_mag(final_ctrl)
+        self.assertGreater(ctrl_mag, 0)
+        mid_ratio_db = 20 * np.log10(mid_band_mag(final_ist) / ctrl_mag)
+        # Pre-fix this measured a systematic -0.146 to -0.201dB deficit
+        # (audio-quality-checker) / -0.29dB (this slice, pre-fix
+        # measurement); -0.05dB sits with real margin above the fix's own
+        # measured +0.01 to +0.07dB while still catching a regression back
+        # toward that deficit.
+        self.assertGreater(mid_ratio_db, -0.05)
+
+    def test_cap_ist_changes_dominant_split_does_not_bottleneck_hf_content(
+            self):
+        # This cycle's investigation of the still-open DIRECTIVES finding
+        # ("no IST-attributable added detail below the original Nyquist
+        # frequency measured against a no-IST control") - a third,
+        # genuinely different attempt after two prior cycles' rejected
+        # fixes (threshold_value=0.15, and per-band FFT thresholding in
+        # perform_ist_iteration - see that function's own docstring
+        # comment). This cycle's specific hypothesis (per the dispatching
+        # task's own suggested angle): maybe perform_ist_iteration already
+        # finds real HF detail, and _cap_ist_changes_to_baseline_peak's
+        # dominant/residual split - not perform_ist_iteration's own
+        # retention - is what discards it, by misclassifying genuine HF
+        # content as "dominant" (its own classification is purely
+        # magnitude-relative across the WHOLE spectrum, at just 0.2% of
+        # the spectrum's own peak, not frequency-scoped) and then shrinking
+        # it via the bounded shrink loop.
+        #
+        # Measured directly (real input_test.mp3, seconds 7-10 - the same
+        # loud, representative slice test_upscale_channels_ist_does_not_
+        # net_attenuate_real_material above uses - at the pinned baseline
+        # config): REFUTED. Reproducing _cap_ist_changes_to_baseline_peak's
+        # own dominant-mask classification (dominant_band_ratio=0.002)
+        # directly against ist_changes' own rfft spectrum shows exactly 0
+        # of 457,051 bins at/above 2kHz are EVER classified "dominant" -
+        # 100% of HF content is already in the untouched "residual" bucket,
+        # never touched by the shrink loop at all. The cap is structurally
+        # not a bottleneck for HF content; whatever HF content perform_ist_
+        # iteration itself produces already passes through this function
+        # unshrunk.
+        #
+        # That still leaves the question of whether that untouched HF
+        # residual carries genuine, reference-correlated detail worth more
+        # exposure (e.g. via a smaller residual-side reduction elsewhere).
+        # Measured directly: an envelope correlation (500-sample rectified-
+        # magnitude moving average, band-limited to 8-19kHz) between the
+        # residual component and the lossless input_test.flac reference
+        # (interpolated the same way, over the same window) sits at ~0.01,
+        # i.e. not meaningfully correlated - consistent with (a genuinely
+        # different measurement path reaching the same conclusion as) the
+        # two prior cycles' own findings that a purely peak-relative/
+        # hard-threshold IST cannot recover genuine detail a lossy source
+        # has already destroyed. Asserted below with generous margin
+        # (0.2), not the measured ~0.01, since this is a coarse diagnostic
+        # correlation metric (not audio-quality-checker's own spectral
+        # analysis) and the point is "not meaningfully correlated", not a
+        # precise figure.
+        if not os.path.exists(_INPUT_TEST_MP3):
+            self.skipTest("input_test.mp3 reference asset not present")
+        if not os.path.exists(_INPUT_TEST_FLAC):
+            self.skipTest("input_test.flac reference asset not present")
+
+        sample_rate, mp3_samples, _ = read_audio(_INPUT_TEST_MP3,
+                                                          format='mp3')
+        _, flac_samples, _ = read_audio(_INPUT_TEST_FLAC, format='flac')
+        mp3_channel = mp3_samples[:, 0].astype(np.float32)
+        flac_channel = flac_samples[:, 0].astype(np.float32)
+        upscale_factor = 7
+        max_iter = 300
+        threshold = 0.6
+        start = 7 * sample_rate
+        n = 3 * sample_rate
+        self.assertLessEqual(start + n, len(mp3_channel),
+                             "input_test.mp3 shorter than expected - "
+                             "re-pick the slice window")
+        self.assertLessEqual(start + n, len(flac_channel),
+                             "input_test.flac shorter than expected - "
+                             "re-pick the slice window")
+
+        mp3_sig = mp3_channel[start:start + n]
+        flac_sig = flac_channel[start:start + n]
+
+        expanded = new_interpolation_algorithm(mp3_sig, upscale_factor)
+        ist_changes = iterative_soft_thresholding(expanded, max_iter,
+                                                   threshold)
+        ref_expanded = new_interpolation_algorithm(flac_sig, upscale_factor)
+        out_sr = sample_rate * upscale_factor
+
+        # Reproduce _cap_ist_changes_to_baseline_peak's own dominant-mask
+        # classification exactly (same formula/default ratio).
+        dominant_band_ratio = 0.002
+        spectrum = np.fft.rfft(ist_changes.astype(np.float64))
+        spec_mag = np.abs(spectrum)
+        spec_peak = np.max(spec_mag)
+        self.assertGreater(spec_peak, 0,
+                           "ist_changes must not be silent on this loud "
+                           "real-material slice - fixture precondition")
+        dominant_mask = spec_mag >= dominant_band_ratio * spec_peak
+        freqs = np.fft.rfftfreq(len(ist_changes), d=1.0 / out_sr)
+        hf_mask = freqs >= 2000
+
+        hf_dominant_bins = int(np.sum(dominant_mask & hf_mask))
+        self.assertEqual(
+            hf_dominant_bins, 0,
+            "the dominant/residual split should not be classifying any "
+            "HF (>=2kHz) content as 'dominant' - if it starts to, the "
+            "cap's shrink loop would become a genuine bottleneck for HF "
+            "detail and this investigation's own conclusion needs "
+            "revisiting")
+
+        residual_spectrum = np.where(dominant_mask, 0, spectrum)
+        residual_component = np.fft.irfft(residual_spectrum,
+                                          n=len(ist_changes))
+
+        def band_filtered(signal, lo, hi):
+            spec = np.fft.rfft(signal.astype(np.float64))
+            f = np.fft.rfftfreq(len(signal), d=1.0 / out_sr)
+            spec_band = np.where((f >= lo) & (f < hi), spec, 0)
+            return np.fft.irfft(spec_band, n=len(signal))
+
+        def envelope(x, block=500):
+            kernel = np.ones(block) / block
+            return np.convolve(np.abs(x), kernel, mode='same')
+
+        def corr(a, b):
+            a = a - a.mean()
+            b = b - b.mean()
+            denom = np.linalg.norm(a) * np.linalg.norm(b)
+            return float(np.dot(a, b) / denom) if denom > 0 else 0.0
+
+        res_hf = band_filtered(residual_component, 8000, 19000)
+        ref_hf = band_filtered(ref_expanded, 8000, 19000)
+        hf_correlation = corr(envelope(res_hf), envelope(ref_hf))
+        self.assertLess(
+            abs(hf_correlation), 0.2,
+            "the fully-untouched HF residual bucket should not be "
+            "meaningfully correlated with the lossless reference - a "
+            "high correlation here would mean the cap's split IS "
+            "discarding real detail somewhere else and this "
+            "investigation's conclusion needs revisiting")
+
+    def test_perform_ist_iteration_excludes_hf_and_converges_in_one_pass_on_real_block(
+            self):
+        # This cycle's second investigation angle for the same still-open
+        # DIRECTIVES finding (see the dominant-split test above for the
+        # first): maybe max_iterations/convergence behaves differently for
+        # dominant (LF) vs non-dominant (HF) content in a way more
+        # iterations could exploit, distinct from the threshold_value
+        # question two prior cycles already investigated and rejected.
+        #
+        # Measured directly (a real 8192-sample block from the middle of
+        # input_test.mp3 seconds 7-10, interpolated at the pinned baseline
+        # config's upscale_factor=7): REFUTED. perform_ist_iteration's own
+        # kept-bin mask (magnitude > 0.6 * the block's own FFT peak,
+        # DC excluded) is bit-for-bit identical between the very first
+        # pass and the second pass - the fixed point is reached
+        # immediately, exactly as the function's own "hard-threshold IST
+        # is a fixed-point projection" comment already claims - and of the
+        # handful of bins ever kept (6, out of thousands of possible HF
+        # bins), none sit at or above 2kHz. Running more passes (a larger
+        # max_iterations) cannot change either fact: the same fixed point
+        # would be reached with 2 passes as with 300. This independently
+        # confirms, via a mechanism (convergence dynamics) genuinely
+        # different from either prior cycle's investigation or this
+        # cycle's dominant-split test above, that the missing-HF-detail
+        # gap sits entirely in perform_ist_iteration's single hard
+        # peak-relative threshold decision itself, not in how many times
+        # it runs or in anything downstream of it.
+        if not os.path.exists(_INPUT_TEST_MP3):
+            self.skipTest("input_test.mp3 reference asset not present")
+
+        sample_rate, mp3_samples, _ = read_audio(_INPUT_TEST_MP3,
+                                                          format='mp3')
+        channel = mp3_samples[:, 0].astype(np.float32)
+        upscale_factor = 7
+        threshold = 0.6
+        start = 7 * sample_rate
+        n = 3 * sample_rate
+        self.assertLessEqual(start + n, len(channel),
+                             "input_test.mp3 shorter than expected - "
+                             "re-pick the slice window")
+        sig = channel[start:start + n]
+
+        expanded = new_interpolation_algorithm(sig, upscale_factor)
+        out_sr = sample_rate * upscale_factor
+        block_size = 8192
+        mid = len(expanded) // 2
+        block = expanded[mid:mid + block_size]
+
+        def kept_mask(data_thres):
+            data_fft = np.fft.fft(data_thres.astype(np.float64))
+            fft_peak = np.max(np.abs(data_fft))
+            mask = np.abs(data_fft) > threshold * fft_peak
+            mask[0] = False
+            return mask
+
+        data_thres = initialize_ist(block, threshold)
+        mask_pass0 = kept_mask(data_thres)
+        self.assertGreater(
+            int(mask_pass0.sum()), 0,
+            "this block should actually keep some content on this loud "
+            "real-material slice - fixture precondition")
+
+        next_data_thres = perform_ist_iteration(data_thres, threshold)
+        mask_pass1 = kept_mask(next_data_thres)
+
+        self.assertTrue(
+            np.array_equal(mask_pass0, mask_pass1),
+            "the kept-bin mask should already be at its fixed point after "
+            "the first refinement pass - if it keeps changing on later "
+            "passes, max_iterations could genuinely matter for HF "
+            "recovery and this investigation's conclusion needs "
+            "revisiting")
+
+        freqs = np.fft.fftfreq(block_size, d=1.0 / out_sr)
+        hf_kept = int(np.sum(mask_pass1 & (np.abs(freqs) >= 2000)))
+        self.assertEqual(
+            hf_kept, 0,
+            "no HF (>=2kHz) bins should ever be kept by this block's own "
+            "hard threshold - if they start being kept, the missing-HF-"
+            "detail gap may no longer be structural and this "
+            "investigation's conclusion needs revisiting")
+
+    def test_iterative_soft_thresholding_block_size_does_not_change_hf_correlation_with_reference(
+            self):
+        # Cycle-2 (iterate-fat-llama) investigation of the still-open
+        # DIRECTIVES finding ("no IST-attributable added detail above
+        # 4kHz vs. a no-IST control"), testing the one suggested angle none
+        # of the four prior investigations covered: whether block_size (the
+        # WOLA analysis/synthesis window length) - not the threshold rule
+        # itself - was limiting genuine HF detail recovery. See
+        # iterative_soft_thresholding's own docstring comment for the full
+        # writeup; this is that investigation's regression coverage.
+        #
+        # Runs the FULL real pipeline tail (iterative_soft_thresholding ->
+        # _cap_ist_changes_to_baseline_peak -> _limit_combined_peak_to_
+        # baseline -> normalize_signal) at several block_size values, since
+        # measuring iterative_soft_thresholding's raw, uncapped output alone
+        # does not reflect what audio-quality-checker actually scores (the
+        # cap/gate/normalize stages materially change the final per-band
+        # gain). Confirms block_size measurably changes how much gets added
+        # (proving this is not a vacuous "nothing ever changes" check) while
+        # the added content's correlation with the lossless reference stays
+        # low regardless - i.e. block_size changes volume, not authenticity.
+        if not os.path.exists(_INPUT_TEST_MP3):
+            self.skipTest("input_test.mp3 reference asset not present")
+        if not os.path.exists(_INPUT_TEST_FLAC):
+            self.skipTest("input_test.flac reference asset not present")
+
+        sample_rate, mp3_samples, _ = read_audio(_INPUT_TEST_MP3,
+                                                          format='mp3')
+        _, flac_samples, _ = read_audio(_INPUT_TEST_FLAC, format='flac')
+        mp3_channel = mp3_samples[:, 0].astype(np.float32)
+        flac_channel = flac_samples[:, 0].astype(np.float32)
+        upscale_factor = 7
+        max_iter = 300
+        threshold = 0.6
+        start = 7 * sample_rate
+        n = 3 * sample_rate
+        self.assertLessEqual(start + n, len(mp3_channel),
+                             "input_test.mp3 shorter than expected - "
+                             "re-pick the slice window")
+        self.assertLessEqual(start + n, len(flac_channel),
+                             "input_test.flac shorter than expected - "
+                             "re-pick the slice window")
+
+        mp3_sig = mp3_channel[start:start + n]
+        flac_sig = flac_channel[start:start + n]
+
+        expanded = new_interpolation_algorithm(mp3_sig, upscale_factor)
+        ref_expanded = new_interpolation_algorithm(flac_sig, upscale_factor)
+        out_sr = sample_rate * upscale_factor
+
+        def band_filtered(signal, lo, hi):
+            spec = np.fft.rfft(signal.astype(np.float64))
+            f = np.fft.rfftfreq(len(signal), d=1.0 / out_sr)
+            spec_band = np.where((f >= lo) & (f < hi), spec, 0)
+            return np.fft.irfft(spec_band, n=len(signal))
+
+        def envelope(x, block=500):
+            kernel = np.ones(block) / block
+            return np.convolve(np.abs(x), kernel, mode='same')
+
+        def corr(a, b):
+            a = a - a.mean()
+            b = b - b.mean()
+            denom = np.linalg.norm(a) * np.linalg.norm(b)
+            return float(np.dot(a, b) / denom) if denom > 0 else 0.0
+
+        gains_16_20k = {}
+        correlations = {}
+        for block_size in (2048, 8192, 32768):
+            ist_changes = iterative_soft_thresholding(
+                expanded, max_iter, threshold, block_size=block_size)
+            capped = _cap_ist_changes_to_baseline_peak(expanded, ist_changes)
+            combined = expanded.astype(np.float32) + capped
+            baseline_peak = float(np.max(np.abs(expanded)))
+            trimmed = _limit_combined_peak_to_baseline(combined,
+                                                        baseline_peak)
+            final_norm = normalize_signal(trimmed.astype(np.float64))
+            control_norm = normalize_signal(expanded.astype(np.float64))
+
+            band = band_filtered(final_norm, 16000, 20000)
+            control_band = band_filtered(control_norm, 16000, 20000)
+            rms_band = np.sqrt(np.mean(band ** 2))
+            rms_control = np.sqrt(np.mean(control_band ** 2)) + 1e-15
+            gains_16_20k[block_size] = 20 * np.log10(
+                (rms_band + 1e-15) / rms_control)
+
+            diff_hf = band_filtered(final_norm - control_norm, 8000, 19000)
+            ref_hf = band_filtered(ref_expanded, 8000, 19000)
+            correlations[block_size] = corr(envelope(diff_hf),
+                                            envelope(ref_hf))
+
+        gain_spread = max(gains_16_20k.values()) - min(gains_16_20k.values())
+        self.assertGreater(
+            gain_spread, 0.1,
+            "block_size should measurably change the 16-20kHz gain "
+            f"(measured spread {gain_spread:.4f}dB across "
+            f"{gains_16_20k}) - if it never does, this test isn't "
+            "actually exercising the block_size lever")
+
+        for block_size, correlation in correlations.items():
+            self.assertLess(
+                abs(correlation), 0.2,
+                f"block_size={block_size}: HF content added vs. a no-IST "
+                f"control should not be meaningfully correlated with the "
+                f"lossless reference (measured {correlation:.4f}) - if a "
+                "particular block_size starts producing reference-"
+                "correlated HF gain, this investigation's conclusion "
+                "(block_size is not a lever for genuine detail recovery) "
+                "needs revisiting")
+
+    def test_iterative_soft_thresholding_noise_floor_relative_threshold_adds_noise_not_detail(
+            self):
+        # Cycle-2 (iterate-fat-llama) investigation of the same still-open
+        # DIRECTIVES finding, testing the second suggested-but-untried
+        # angle: a two-pass, per-bin noise-floor-relative threshold (first
+        # pass estimates each frequency bin's own noise floor across every
+        # WOLA block of the file; second pass keeps bins above a multiplier
+        # of that floor, instead of perform_ist_iteration's single
+        # block-global-peak-relative threshold). This mechanism was never
+        # wired into perform_ist_iteration/production code - it is
+        # reimplemented self-contained here, purely to measure whether the
+        # mechanism CLASS has any merit before considering shipping it. See
+        # perform_ist_iteration's own docstring comment for the full
+        # writeup; this is that investigation's regression coverage,
+        # documenting why it was rejected so a future cycle does not have
+        # to re-run this experiment from scratch.
+        if not os.path.exists(_INPUT_TEST_MP3):
+            self.skipTest("input_test.mp3 reference asset not present")
+        if not os.path.exists(_INPUT_TEST_FLAC):
+            self.skipTest("input_test.flac reference asset not present")
+
+        sample_rate, mp3_samples, _ = read_audio(_INPUT_TEST_MP3,
+                                                          format='mp3')
+        _, flac_samples, _ = read_audio(_INPUT_TEST_FLAC, format='flac')
+        mp3_channel = mp3_samples[:, 0].astype(np.float32)
+        flac_channel = flac_samples[:, 0].astype(np.float32)
+        upscale_factor = 7
+        start = 7 * sample_rate
+        n = 3 * sample_rate
+        mp3_sig = mp3_channel[start:start + n]
+        flac_sig = flac_channel[start:start + n]
+
+        expanded = new_interpolation_algorithm(mp3_sig, upscale_factor)
+        ref_expanded = new_interpolation_algorithm(flac_sig, upscale_factor)
+        out_sr = sample_rate * upscale_factor
+
+        block_size = 8192
+        hop = block_size // 2
+        window = np.sqrt(0.5 - 0.5 * np.cos(
+            2 * np.pi * np.arange(block_size) / block_size))
+        pad = hop
+        padded = np.concatenate([
+            np.zeros(pad), expanded.astype(np.float64),
+            np.zeros(block_size)])
+        padded_len = len(padded)
+        starts = list(range(0, padded_len - block_size + 1, hop))
+
+        mags = np.array([
+            np.abs(np.fft.fft(padded[s:s + block_size] * window))
+            for s in starts
+        ])
+        # Per-bin noise floor: 20th percentile magnitude across every
+        # block of the whole slice - a robust "typical quiet level" for
+        # that specific frequency bin, distinct from any single block's
+        # own peak (what perform_ist_iteration actually uses).
+        floor = np.percentile(mags, 20, axis=0)
+
+        multiplier = 2.0
+        output = np.zeros(padded_len)
+        weight = np.zeros(padded_len)
+        for s in starts:
+            frame = padded[s:s + block_size] * window
+            spec = np.fft.fft(frame)
+            mask = np.abs(spec) > multiplier * floor
+            mask[0] = False
+            spec_thres = np.where(mask, spec, 0)
+            result = np.fft.ifft(spec_thres).real
+            windowed = result * window
+            windowed = windowed - window * (
+                np.sum(windowed) / np.sum(window))
+            output[s:s + block_size] += windowed
+            weight[s:s + block_size] += window * window
+        safe_w = np.where(weight > 1e-8, weight, 1.0)
+        ist_changes = (output / safe_w)[pad:pad + len(expanded)]
+
+        def band_filtered(signal, lo, hi):
+            spec = np.fft.rfft(signal.astype(np.float64))
+            f = np.fft.rfftfreq(len(signal), d=1.0 / out_sr)
+            spec_band = np.where((f >= lo) & (f < hi), spec, 0)
+            return np.fft.irfft(spec_band, n=len(signal))
+
+        def envelope(x, block=500):
+            kernel = np.ones(block) / block
+            return np.convolve(np.abs(x), kernel, mode='same')
+
+        def corr(a, b):
+            a = a - a.mean()
+            b = b - b.mean()
+            denom = np.linalg.norm(a) * np.linalg.norm(b)
+            return float(np.dot(a, b) / denom) if denom > 0 else 0.0
+
+        combined = expanded.astype(np.float64) + ist_changes
+        control_band = band_filtered(expanded, 16000, 20000)
+        combined_band = band_filtered(combined, 16000, 20000)
+        rms_control = np.sqrt(np.mean(control_band ** 2)) + 1e-15
+        rms_combined = np.sqrt(np.mean(combined_band ** 2))
+        gain_db = 20 * np.log10((rms_combined + 1e-15) / rms_control)
+
+        # This mechanism DOES add a large amount of HF-band level (proving
+        # this test exercises a real effect, not a no-op) ...
+        self.assertGreater(
+            gain_db, 3.0,
+            "the noise-floor-relative threshold should measurably raise "
+            f"the 16-20kHz band vs. a no-IST control (measured "
+            f"{gain_db:.4f}dB) - if it stops doing so, this test isn't "
+            "actually exercising the mechanism under investigation")
+
+        res_hf = band_filtered(ist_changes, 8000, 19000)
+        ref_hf = band_filtered(ref_expanded, 8000, 19000)
+        hf_correlation = corr(envelope(res_hf), envelope(ref_hf))
+
+        # ... but that added content is not reference-correlated: it is the
+        # decoder's own dequantization noise floor, amplified uniformly
+        # across nearly the entire HF range (not selectively recovered
+        # programme detail). If a future cycle's tuning of this mechanism
+        # starts producing meaningfully correlated content, this
+        # investigation's rejection needs revisiting.
+        self.assertLess(
+            abs(hf_correlation), 0.2,
+            "the noise-floor-relative threshold's own HF content should "
+            f"not be meaningfully correlated with the lossless reference "
+            f"(measured {hf_correlation:.4f})")
 
     def test_iterative_soft_thresholding_chains_across_iterations(self):
         data = np.array([0.9, 0.1, -0.8, 0.05, 0.7, -0.2, 0.3, -0.6],

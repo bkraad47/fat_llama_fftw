@@ -229,6 +229,115 @@ def perform_ist_iteration(data_thres, threshold):
     # description and README's "Why FFT and IST?"). Scaling by the current
     # peak makes the same threshold_value meaningful regardless of the
     # input's absolute numeric scale.
+    #
+    # Investigated this cycle and NOT adopted: per-band (rather than
+    # whole-spectrum) peak-relative thresholding, as a direct attempt at
+    # the "no measurable added detail above ~800Hz" finding - splitting
+    # the spectrum into N equal-bin-count bands and thresholding each
+    # against its own local peak (instead of one global peak) does let a
+    # quieter-in-absolute-terms HF band's bins individually clear a bar
+    # set by its own dynamics rather than an unrelated, much louder LF
+    # band's peak. Measured directly (real input_test.mp3, pinned baseline
+    # config, against a no-IST interpolation-only control) this did raise
+    # the 16-19kHz band from -0.05dB to as much as +0.18 to +6.8dB
+    # depending on band count - but two independent checks showed this was
+    # not genuine added detail: (1) a direct envelope-correlation check of
+    # that band against the lossless input_test.flac reference stayed at
+    # the same very low ~0.02-0.08 correlation regardless of band count
+    # (1, 4, 8) - the apparent gain was not becoming more reference-
+    # correlated, i.e. not more "real", just louder; (2) reproducing this
+    # on the existing block-boundary-discontinuity regression fixture (a
+    # single stationary tone - see test_iterative_soft_thresholding_no_
+    # block_boundary_discontinuity) reopened that exact regression at
+    # n_bands=4 (max |2nd-difference| 1160 vs. a 838 bound) - a band with
+    # no genuine content still keeps ~(1-threshold) of its own bins purely
+    # from being compared to its own (noise-floor) local peak, and that
+    # noise-floor selection differs block-to-block for otherwise-identical
+    # blocks, producing exactly the WOLA-boundary click this test exists
+    # to catch. Adding a safety floor (only band-threshold a segment if its
+    # own peak is >= some ratio of the whole spectrum's peak, else fall
+    # back to the original global-peak threshold there) fixes that
+    # regression - but at every floor tried (0.05, 0.1, 0.2) it also
+    # completely erases the measured real-material gain (back to the
+    # unbanded -0.05dB), because the real 16-19kHz band's own peak, on
+    # real material, sits below even a 5% floor relative to the block's
+    # global (LF-dominated) peak. Net conclusion: the apparent gain and the
+    # regression share the same root cause (thresholding a band that has
+    # no genuine relative content against its own tiny local peak), so a
+    # safe version of this change provides no measurable benefit - this
+    # independently reproduces and reinforces the prior investigation's own
+    # finding (see _cap_ist_changes_to_baseline_peak's docstring) that a
+    # single whole-block scalar structurally cannot discriminate here, via
+    # a different mechanism (per-band thresholding, not just a lower
+    # threshold_value) reaching the same practical limit: the source MP3's
+    # own lossy compression has already destroyed this content before this
+    # pipeline ever sees it, and no post-hoc peak-relative-threshold
+    # variant operating only on what survives can genuinely recover it
+    # without becoming bandwidth-extension-style synthesis (out of scope
+    # per project-mission.md). Left as fft/ifft (unchanged) - not adopting
+    # this fix means there was no reason to also change the FFT
+    # representation.
+    #
+    # Investigated a later cycle (again NOT adopted): whether max_iter /
+    # convergence behavior differs meaningfully between dominant (LF) and
+    # non-dominant (HF) content in a way that running more passes could
+    # exploit - a mechanism genuinely distinct from both the threshold_
+    # value experiment and the per-band variant above. Measured directly
+    # on a real 8192-sample block from input_test.mp3 (seconds 7-10,
+    # loudest region, pinned baseline upscale_factor=7): the kept-bin mask
+    # (magnitude > threshold * this pass's own FFT peak, DC excluded) is
+    # bit-for-bit identical between the very first refinement pass and the
+    # second - the fixed point this function's own docstring already
+    # claims is reached immediately, not gradually across many passes -
+    # and of the handful of bins ever kept (6, out of thousands of
+    # possible HF bins on that block), none sit at or above 2kHz. More
+    # max_iterations cannot change either fact: the same fixed point is
+    # reached whether the caller allows 2 passes or 300. See
+    # test_perform_ist_iteration_excludes_hf_and_converges_in_one_pass_on_
+    # real_block in test_feed.py for the regression coverage. This closes
+    # off "more iterations" as a lever for the still-open "no measurable
+    # added detail above ~800Hz" finding, the same way the per-band
+    # variant above closed off "a looser/differently-scoped threshold" -
+    # the gap sits entirely in this function's single hard peak-relative
+    # threshold decision on each block's first pass, not in anything
+    # iteration-count-related or downstream of it.
+    #
+    # Investigated a later cycle (again NOT adopted): a two-pass, per-bin
+    # noise-floor-relative threshold - replace "keep bins above
+    # threshold * this block's own global peak" with "keep bins above
+    # multiplier * this bin's own noise floor", where the floor is
+    # estimated per-frequency-bin (a first pass, 20th-percentile magnitude
+    # across every WOLA block of the whole signal) rather than derived from
+    # any single block's own dynamics. This is a genuinely different
+    # mechanism class from both the per-band-peak variant above (which
+    # compares a bin to its OWN block's local peak) and the dominant/
+    # residual split in _cap_ist_changes_to_baseline_peak (which operates
+    # on ist_changes after the fact, not on the threshold decision itself).
+    # Measured directly on real input_test.mp3 (seconds 7-10, pinned
+    # baseline upscale_factor=7): the per-bin floor is ~5.6e5x smaller for
+    # HF bins (>=2kHz) than LF bins on this material (median ~2.2e-5 vs.
+    # ~12.4) - i.e. the decoded MP3's HF content isn't "quiet signal
+    # hiding near a noise floor" that a floor-relative threshold could
+    # selectively recover, it is uniformly near-zero across virtually the
+    # entire HF range (8085 of 8192 bins in one representative block
+    # already qualify as ">=2kHz"), so ANY floor-relative multiplier
+    # (tried: 1.5, 2.0, 3.0, 5.0) keeps the large majority of them
+    # indiscriminately. Effect: a large, uniform +4.8 to +6.0dB gain
+    # across every band from 2kHz to 20kHz alike (not concentrated where
+    # real programme content would be), while envelope correlation against
+    # the lossless input_test.flac reference measured essentially zero
+    # (-0.0045 to -0.0055, i.e. no correlation at all - worse than the
+    # per-band variant's already-low ~0.02-0.08). This is not masked
+    # signal a smarter threshold can uncover; it is the decoder's own
+    # dequantization noise floor, amplified uniformly. See
+    # test_iterative_soft_thresholding_noise_floor_relative_threshold_
+    # adds_noise_not_detail in test_feed.py for the regression coverage.
+    # Left as fft/ifft (unchanged) for the same reason the per-band
+    # variant above was rejected: the source MP3 has already destroyed
+    # this content before this pipeline ever sees it, and no post-hoc
+    # relative-threshold variant operating on what survives - global peak,
+    # per-band peak, or per-bin noise floor - can distinguish "real but
+    # quiet" from "gone" here.
     data_fft = pyfftw.interfaces.numpy_fft.fft(data_thres)
     fft_peak = np.max(np.abs(data_fft))
     if fft_peak == 0:
@@ -305,6 +414,33 @@ def iterative_soft_thresholding(data, max_iter, threshold,
     # window boundary sits) and each block's own hard-threshold fixed
     # point is found independently, so this does not reintroduce the
     # cycle-1 non-chaining bug or lose its convergence early-exit.
+    #
+    # Investigated a later cycle (NOT adopted, block_size default
+    # unchanged): whether block_size itself - not the threshold rule - was
+    # limiting genuine high-frequency detail recovery, a mechanism
+    # genuinely distinct from the four prior investigations into
+    # threshold_value, per-band thresholding, the peak-cap's dominant/
+    # residual split, and iteration count (see perform_ist_iteration's and
+    # _cap_ist_changes_to_baseline_peak's own docstring comments). Measured
+    # directly on real input_test.mp3/.flac (seconds 7-10, pinned baseline
+    # upscale_factor=7, threshold=0.6) across block_size in {2048, 4096,
+    # 8192 (default), 16384, 32768} through the FULL real pipeline tail
+    # (this function -> _cap_ist_changes_to_baseline_peak ->
+    # _limit_combined_peak_to_baseline -> normalize, matching what
+    # audio-quality-checker actually scores): the measured per-band gain
+    # vs. a no-IST control DOES shift with block_size (e.g. the 16-20kHz
+    # band ranged from +0.35dB at 8192 up to +1.00dB at 2048), so
+    # block_size is not inert - but the envelope correlation of that
+    # gained content against the lossless reference stayed essentially
+    # flat (~0.037-0.044) across every block_size tried, both larger and
+    # smaller than the current default. A lever that changes how MUCH gets
+    # added without changing whether it is genuine, reference-correlated
+    # detail confirms the same root cause the other four investigations
+    # already converged on (the content is not there to recover, at any
+    # window length), rather than opening a new one. See
+    # test_iterative_soft_thresholding_block_size_does_not_change_hf_
+    # correlation_with_reference in test_feed.py for the regression
+    # coverage.
     n = len(data)
     if n <= block_size:
         return _ist_chain(data, max_iter, threshold, convergence_tol)
@@ -397,8 +533,126 @@ def iterative_soft_thresholding(data, max_iter, threshold,
     return output[pad:pad + n].astype(np.float32)
 
 
+def _local_peak_envelope(signal, block_size=8192):
+    """Smooth, WOLA-based local-peak-magnitude envelope of `signal`.
+
+    Estimates each block_size-sample analysis window's own peak magnitude
+    (max(abs(.)) of that windowed block) and reconstructs a smooth envelope
+    via the same 50%-hop sqrt-Hann analysis/synthesis windowed-overlap-add
+    (WOLA) machinery iterative_soft_thresholding already uses for its own
+    block reconstruction above - a scalar "block peak" value is broadcast
+    across the block and accumulated with the identical window**2 weighting
+    iterative_soft_thresholding uses, rather than reinventing a second,
+    differently-normalized WOLA. This is intentionally a separate, smaller
+    function (not a refactor of iterative_soft_thresholding's own loop)
+    so this new envelope estimate carries zero risk to that function's own,
+    already-tested WOLA/DC-leak-correction behavior - the two share the
+    same window/hop/overlap-add *shape*, not a code path.
+
+    Used by _cap_ist_changes_to_baseline_peak to gate its frequency-
+    selective correction: a channel's own quiet/onset regions (low local
+    envelope relative to the channel's overall peak) should receive little
+    to none of that correction, since they were never responsible for the
+    peak overshoot the correction exists to bound.
+    """
+    n = len(signal)
+    if n == 0:
+        return np.zeros(0, dtype=np.float32)
+    if n <= block_size:
+        return np.full(n, np.max(np.abs(signal)), dtype=np.float32)
+
+    hop = block_size // 2
+    window = np.sqrt(
+        0.5 - 0.5 * np.cos(2 * np.pi * np.arange(block_size) / block_size))
+
+    pad = hop
+    padded = np.concatenate([
+        np.zeros(pad, dtype=np.float64),
+        np.asarray(signal, dtype=np.float64),
+        np.zeros(block_size, dtype=np.float64),
+    ])
+    padded_len = len(padded)
+
+    output = np.zeros(padded_len, dtype=np.float64)
+    weight = np.zeros(padded_len, dtype=np.float64)
+    window_sq = window * window
+    for start in range(0, padded_len - block_size + 1, hop):
+        block_peak = np.max(np.abs(padded[start:start + block_size]))
+        output[start:start + block_size] += block_peak * window_sq
+        weight[start:start + block_size] += window_sq
+
+    safe_weight = np.where(weight > 1e-8, weight, 1.0)
+    envelope = output / safe_weight
+    return envelope[pad:pad + n].astype(np.float32)
+
+
+def _local_rms_envelope(signal, block_size=2048):
+    """Smooth, WOLA-based local-RMS-magnitude envelope of `signal`.
+
+    Same WOLA (50%-hop sqrt-Hann analysis/synthesis, window**2-weighted
+    overlap-add) machinery as _local_peak_envelope above, but each block's
+    own scalar is its RMS (sqrt(mean(x**2))), not its peak (max(abs(x))).
+    Kept as a separate function (not a peak/RMS toggle on
+    _local_peak_envelope) for the same reason that one is separate from
+    iterative_soft_thresholding's own WOLA loop: zero risk to either
+    already-tested function's own behavior.
+
+    Used by _cap_ist_changes_to_baseline_peak (this cycle) for its "does
+    the dominant-band shrink correction help or hurt, in this local
+    region" decision - RMS, not peak, because that decision is inherently
+    noisy at peak-envelope granularity: a single sample's instantaneous
+    peak near a quiet, oscillating (non-stationary, multi-tone) signal
+    depends heavily on which individual sample a short analysis window
+    happens to catch near its own zero crossings, so a peak-based ratio
+    between a "corrected" and "uncorrected" candidate can register as
+    "helps" for one block and "hurts" for its immediate neighbor even
+    within what is really one contiguous, uniformly-behaved region -
+    measured directly (see _cap_ist_changes_to_baseline_peak's own
+    docstring for the numbers) to leave several hundred samples right at
+    the quietest point of a synthetic fade-in onset mis-classified as
+    "helps" when the region's own actual RMS behavior (and the regression
+    test that exists for it) says it clearly does not. RMS over the same
+    WOLA block is far less sensitive to exactly which sample lands where
+    within the window, giving a decisive, low-noise gate.
+    """
+    n = len(signal)
+    if n == 0:
+        return np.zeros(0, dtype=np.float32)
+    if n <= block_size:
+        rms = np.sqrt(np.mean(np.asarray(signal, dtype=np.float64) ** 2))
+        return np.full(n, rms, dtype=np.float32)
+
+    hop = block_size // 2
+    window = np.sqrt(
+        0.5 - 0.5 * np.cos(2 * np.pi * np.arange(block_size) / block_size))
+
+    pad = hop
+    padded = np.concatenate([
+        np.zeros(pad, dtype=np.float64),
+        np.asarray(signal, dtype=np.float64),
+        np.zeros(block_size, dtype=np.float64),
+    ])
+    padded_len = len(padded)
+
+    output = np.zeros(padded_len, dtype=np.float64)
+    weight = np.zeros(padded_len, dtype=np.float64)
+    window_sq = window * window
+    for start in range(0, padded_len - block_size + 1, hop):
+        block_rms = np.sqrt(np.mean(padded[start:start + block_size] ** 2))
+        output[start:start + block_size] += block_rms * window_sq
+        weight[start:start + block_size] += window_sq
+
+    safe_weight = np.where(weight > 1e-8, weight, 1.0)
+    envelope = output / safe_weight
+    return envelope[pad:pad + n].astype(np.float32)
+
+
 def _cap_ist_changes_to_baseline_peak(expanded_channel, ist_changes,
-                                      max_rounds=20):
+                                      max_rounds=20, dominant_band_ratio=0.002,
+                                      safety_margin=1.2, gate_block_size=2048,
+                                      gate_steepness=10.0,
+                                      silence_floor_ratio=0.005,
+                                      silence_gate_power=6.0):
     # perform_ist_iteration's peak-relative FFT threshold keeps/boosts
     # whichever frequency dominates a block's own spectrum - for real
     # music that is usually low-frequency content, since natural audio
@@ -480,24 +734,432 @@ def _cap_ist_changes_to_baseline_peak(expanded_channel, ist_changes,
     # own assessment that a scalar-rescale-based fix is close to its
     # practical limit for this mechanism - max_rounds=20 is the verified
     # improvement available within that limit, not a full fix.
+    #
+    # This cycle ported two further refinements from the CUDA sibling repo
+    # (bkraad47/fat_llama)'s own v-2.0.0 branch - pure numpy/FFT logic,
+    # translated cupy -> numpy/pyfftw here, no CUDA-specific mechanism:
+    #
+    # 1. Frequency-selective dominant/residual split. The whole-signal
+    # uniform scalar shrink above rescales EVERY sample of ist_changes by
+    # the same ratio, even though only whichever frequency band actually
+    # dominates its own spectrum is responsible for the overshoot (natural
+    # spectra concentrate energy at low frequencies - see this function's
+    # own comment above). That means quiet/high-frequency detail IST
+    # genuinely added - exactly the content this whole cap mechanism exists
+    # to *keep* - gets suppressed by nearly the same ratio as the dominant
+    # band, even though it never caused the peak growth being corrected.
+    # Measured directly on a loud-low-tone/quiet-high-tone fixture: the
+    # quiet band survived the old uniform shrink at only ~4% of its own
+    # uncapped magnitude. Splitting ist_changes' own rfft spectrum into a
+    # "dominant" component (bins whose magnitude >= dominant_band_ratio
+    # times the spectrum's own peak magnitude) and a "residual" component
+    # (everything else), then applying the exact same bounded iterative
+    # shrink as above but scoped to ONLY the dominant component (leaving
+    # residual untouched), keeps the same overshoot-bounding mechanism
+    # while no longer taxing content the dominant band never touched.
+    #
+    # 2. Envelope-gated correction. Splitting via a single whole-buffer FFT
+    # and applying one fixed scalar correction to the dominant component is
+    # itself found (this cycle, via a broadband raised-cosine fade-in
+    # fixture) to be a problem for genuinely non-stationary material: a
+    # real track's quiet onset is often reconstructed by a near-exact
+    # cancellation between what this split calls "dominant" and "residual"
+    # content (both derived from the same whole-buffer spectrum, so they
+    # necessarily overlap in time even though they're disjoint in
+    # frequency). Shrinking only the dominant component by a fixed scalar
+    # breaks that cancellation, "unmasking" disproportionate energy
+    # specifically where the real signal is quietest - measured on the CUDA
+    # sibling as up to +18.5dB frame-RMS elevation in a fade-in's first
+    # ~0.5s. The fix: taper the dominant-band correction itself,
+    # (1 - dominant_scale) * dominant_component, by a smooth local-peak-
+    # envelope estimate of expanded_channel (the pre-IST baseline) - see
+    # _local_peak_envelope above.
+    #
+    # This cycle's regression and its fix: the first version of this gate
+    # (gate = clip(envelope / baseline_peak, 0, 1), i.e. gated purely
+    # relative to the channel's single loudest instant) was measured
+    # directly on real programme material (input_test.mp3's own loudest
+    # 3s region) to sit at gate<1 for 99.6% of samples, median ~0.58 - real
+    # music has a crest factor (a typical block's own local peak well
+    # below the track's single loudest moment) almost everywhere, not just
+    # at genuine quiet onsets/fade-ins, so that design suppressed the
+    # dominant-band correction almost everywhere instead of only where the
+    # onset fix was meant to apply it: ist_changes retained 24-29% of its
+    # own uncapped peak on real material instead of the ~7-13% max_rounds
+    # was tuned to (see comment above), and the surviving LF-dominated
+    # excess showed up post-normalize as a ~1.0-1.55dB 20-300Hz boost that
+    # taxed every other band.
+    #
+    # The fix: gate on the envelope's ratio to baseline_peak relative to a
+    # small onset_gate_ratio floor, not to 1.0 directly - gate =
+    # clip((envelope / baseline_peak) / onset_gate_ratio, 0, 1). This
+    # saturates to gate=1 (the full correction the frequency-selective
+    # split computed) as soon as the local envelope reaches
+    # onset_gate_ratio of the channel's own peak, rather than requiring it
+    # approach that peak directly - ordinary crest-factor variation across
+    # a track's loud passages (measured min ratio ~0.45 on the same real
+    # slice above) now saturates the gate to 1 throughout, restoring the
+    # design's normal engagement there (measured: retention back down to
+    # ~13.5%, in-range), while a genuinely quiet passage or fade-in onset
+    # (measured ratio down to ~0.01-0.03 at the start of the same track,
+    # and as low as the floor~0.02 on the synthetic fade-in fixture this
+    # mechanism was built for) still falls well below the floor and gates
+    # down toward 0 as before. onset_gate_ratio=0.3 was chosen from this
+    # same measurement: every onset_gate_ratio in roughly [0.05, 0.35]
+    # keeps the fade-in fixture's onset-window RMS elevation comfortably
+    # under the 3dB regression bound (0.3 measures ~+0.03dB there, vs. the
+    # ungated failure's +6.4dB), and every value up to ~0.35 already
+    # saturates to gate=1 throughout the real loud-material slice (whose
+    # own min ratio is ~0.45) - 0.3 sits with margin inside both bounds
+    # rather than at either edge. A region near the channel's own peak
+    # (gate at/near 1) receives the full correction the frequency-selective
+    # split computed; a genuinely quiet/onset region (gate near 0) still
+    # receives little to none of it, since it was never responsible for
+    # the overshoot. The same gating is applied to the safety-net
+    # fallback's own correction below, for consistency.
+    #
+    # A later cycle's finding (audio-quality-checker, post-v2.0.0 ship) and
+    # its fix, superseding onset_gate_ratio: that same "gate near 0 in
+    # quiet regions" design has a structural cost the fade-in fixture alone
+    # never exercised - "gate near 0" means "apply essentially none of the
+    # dominant-band correction", i.e. pass ist_changes through close to
+    # fully uncapped, in ANY region whose local envelope sits below the
+    # onset_gate_ratio floor relative to the channel's own peak - not just
+    # genuine near-cancelling onsets. Measured directly on real programme
+    # material (input_test.mp3, two ordinary quiet regions - an early
+    # ~0.5-1.0s window and a ~14.8-15.05s fade-out tail): gate sat at
+    # 0.06-0.25 there (same order as a genuine onset), leaving the
+    # dominant-band component's own uncapped magnitude largely intact -
+    # its RMS in that window was 44-58% of expanded_channel's own RMS
+    # there, which is exactly the kind of real, non-cancelling excess the
+    # gate was never able to distinguish from a genuine fade-in using only
+    # envelope/baseline_peak as a proxy (both situations measure similarly
+    # "quiet relative to the channel's single loudest instant" - the ratio
+    # this gate used cannot tell them apart at all). Measured net effect:
+    # a +2.0 to +2.5dB 150-2000Hz elevation in the quietest 5% of frames
+    # relative to a no-IST interpolation-only control, i.e. real detail
+    # IST never earned, added specifically where a listener would notice
+    # a fade the most.
+    #
+    # Directly testing the underlying assumption (this cycle): forcing the
+    # OLD gate to 1 (full dominant-band shrink, no gating at all) on those
+    # same two real windows did NOT reproduce the fade-in fixture's
+    # "unmasking" regression (+6.4dB there) - instead it dropped the
+    # windows' own combined-vs-baseline RMS elevation from +2.3-2.4dB down
+    # to +0.24-0.29dB, i.e. applying the correction HELPED on real
+    # material, in direct contradiction of what helps on the synthetic
+    # near-cancellation fixture. A single fixed ratio (onset_gate_ratio)
+    # cannot resolve this - both scenarios sit at a similarly low
+    # envelope/baseline_peak ratio, so no threshold on that one quantity
+    # can separate "quiet because dominant/residual genuinely cancel here"
+    # (where shrinking dominant alone breaks the cancellation and unmasks
+    # residual - correction hurts) from "quiet with real, non-cancelling
+    # excess" (correction helps) - the two cases this whole gate exists to
+    # tell apart.
+    #
+    # The fix: stop inferring "helps or hurts" from a global peak ratio and
+    # measure it directly, per local region, using the same WOLA machinery
+    # already in this module. Compute the LOCAL RMS envelope
+    # (_local_rms_envelope, new this cycle) of the fully-UNcorrected
+    # combined candidate (expanded + dominant_component + residual) and of
+    # the fully-corrected one (expanded + scaled_dominant + residual);
+    # their ratio directly says whether applying the shrink would raise or
+    # lower this specific region's own combined level. gate = clip(1 -
+    # gate_steepness * (ratio - 1), 0, 1): ratio <= 1 (correction does not
+    # increase local level - it is doing its job) saturates gate to 1 (full
+    # correction, same as the old design's loud-passage behavior); ratio >
+    # 1 (correction increases local level - the unmasking signature) ramps
+    # gate down toward 0 as the harm grows. RMS, not peak
+    # (_local_peak_envelope, still used elsewhere), because the decision is
+    # measurably noisy at peak-envelope granularity for a quiet,
+    # oscillating multi-tone signal - a peak-based version of this exact
+    # gate left ~150-300ms right at the fade-in fixture's quietest point
+    # mis-classified as "helps" (see _local_rms_envelope's own docstring),
+    # reproducing most of the regression it exists to prevent;
+    # gate_block_size=2048 (finer than iterative_soft_thresholding's own
+    # 8192, needed to resolve a fade-in fast enough relative to the
+    # regression test's own 1024-sample onset window - 8192 blends too much
+    # of the louder post-onset ramp into the same WOLA block) and
+    # gate_steepness=10.0 were both verified stable across a
+    # [1024, 4096] x [5, 20] neighborhood (mean real-material quiet-window
+    # elevation staying in a 0.39-0.47dB band, fade-onset elevation
+    # unchanged at ~0.42dB throughout), i.e. not a narrow, fragile fit to
+    # one measurement. Verified directly: this fix keeps the fade-in
+    # fixture's own regression bound intact (~0.42dB, comfortably under the
+    # 3dB bound, versus onset_gate_ratio's own ~0.03dB - still a large
+    # margin, not a regression of that protection) while dropping the real-
+    # material quiet-window elevation from ~+2.0/+2.5dB (mean/max) to
+    # ~+0.45/+1.9dB - a large, targeted reduction achieved by correctly
+    # applying the correction in ordinary quiet passages instead of
+    # withholding it everywhere a fixed ratio could not tell apart from a
+    # genuine onset. onset_gate_ratio is retired (no test referenced it
+    # directly); the frequency-selective dominant/residual split above, the
+    # shrink-loop mechanics, and the safety-net fallback are all otherwise
+    # unchanged - only what decides "how much of the dominant-band
+    # correction applies here" changed.
+    #
+    # Investigated a later cycle (NOT adopted, this function unchanged
+    # below): whether this function's own dominant/residual split - not
+    # perform_ist_iteration's retention - is what discards genuine HF
+    # detail, for the still-open "no measurable added detail below the
+    # original Nyquist frequency" DIRECTIVES finding (two prior cycles
+    # investigated threshold_value and per-band FFT thresholding instead -
+    # see perform_ist_iteration's own docstring comments - and rejected
+    # both). The dominant classification below is purely magnitude-
+    # relative across the WHOLE ist_changes spectrum (>= dominant_band_
+    # ratio, 0.2%, of that spectrum's own peak), not frequency-scoped, so
+    # in principle genuine HF content that individually clears that bar
+    # could be swept into the shrunk dominant bucket alongside genuinely-
+    # dominant LF content. Measured directly (real input_test.mp3 seconds
+    # 7-10, pinned baseline config): REFUTED. Exactly 0 of 457,051 rfft
+    # bins at/above 2kHz are ever classified dominant - 100% of HF content
+    # is already in the untouched residual bucket, never touched by the
+    # shrink loop below. This function is not a bottleneck for HF content
+    # at all; whatever HF content perform_ist_iteration produces already
+    # passes through here unshrunk. A further check - an envelope
+    # correlation between that fully-untouched HF residual and the
+    # lossless input_test.flac reference over the same window - measured
+    # ~0.01, i.e. not meaningfully correlated, independently reaching (via
+    # a mechanism genuinely different from either prior cycle's own
+    # investigation, or perform_ist_iteration's own convergence-angle
+    # investigation next to this one) the same conclusion: the missing
+    # detail was already destroyed upstream, before this function or
+    # perform_ist_iteration's own iteration count ever gets a chance to
+    # recover it. See test_cap_ist_changes_dominant_split_does_not_
+    # bottleneck_hf_content in test_feed.py for the regression coverage.
     baseline_peak = np.max(np.abs(expanded_channel))
     if baseline_peak == 0:
         return ist_changes
-    current = ist_changes
+
+    expanded_f32 = expanded_channel.astype(np.float32)
+    uncapped_combined_peak = np.max(np.abs(expanded_f32 + ist_changes))
+    if uncapped_combined_peak <= baseline_peak or uncapped_combined_peak == 0:
+        return ist_changes
+
+    n = len(ist_changes)
+    spectrum = pyfftw.interfaces.numpy_fft.rfft(
+        np.asarray(ist_changes, dtype=np.float64))
+    spec_mag = np.abs(spectrum)
+    spec_peak = np.max(spec_mag)
+
+    if spec_peak == 0:
+        # Nothing to split - ist_changes is silent, so there is nothing to
+        # shrink or gate either.
+        return ist_changes
+
+    dominant_mask = spec_mag >= dominant_band_ratio * spec_peak
+    dominant_spectrum = np.where(dominant_mask, spectrum, 0)
+    residual_spectrum = np.where(dominant_mask, 0, spectrum)
+    dominant_component = pyfftw.interfaces.numpy_fft.irfft(
+        dominant_spectrum, n=n).astype(np.float32)
+    residual_component = pyfftw.interfaces.numpy_fft.irfft(
+        residual_spectrum, n=n).astype(np.float32)
+
+    # Bound only the dominant component's own contribution to the combined
+    # peak, via the same bounded multiplicative-shrink loop as the
+    # pre-existing whole-signal cap above (reused verbatim, just scoped to
+    # a scalar applied to the dominant component instead of to all of
+    # ist_changes) - residual_component never enters this loop, so it is
+    # never touched by it.
+    dominant_scale = 1.0
+    scaled_dominant = dominant_component
     for _ in range(max_rounds):
-        combined = expanded_channel.astype(np.float32) + current
+        candidate = expanded_f32 + scaled_dominant + residual_component
+        candidate_peak = np.max(np.abs(candidate))
+        if candidate_peak <= baseline_peak or candidate_peak == 0:
+            break
+        dominant_scale *= baseline_peak / candidate_peak
+        scaled_dominant = dominant_component * dominant_scale
+
+    env_uncorrected = _local_rms_envelope(
+        expanded_f32 + dominant_component + residual_component,
+        block_size=gate_block_size)
+    env_corrected = _local_rms_envelope(
+        expanded_f32 + scaled_dominant + residual_component,
+        block_size=gate_block_size)
+    safe_env_uncorrected = np.maximum(env_uncorrected, 1e-9)
+    local_ratio = env_corrected / safe_env_uncorrected
+    gate = np.clip(
+        1.0 - gate_steepness * (local_ratio - 1.0), 0.0, 1.0
+    ).astype(np.float32)
+
+    dominant_correction = (1 - dominant_scale) * dominant_component
+    gated_dominant = dominant_component - gate * dominant_correction
+    candidate_result = residual_component + gated_dominant
+
+    # This cycle's fix (a genuine digital-silence lead-in, found by
+    # audio-quality-checker as a residual confined to a real track's very
+    # first frames, after the broader quiet-passage elevation above was
+    # fixed): the "helps or hurts" gate above only ever chooses between two
+    # candidates (fully shrink the dominant band, or don't) - it cannot
+    # suppress ist_changes altogether, and residual_component is never
+    # touched by it at all (by design - see the docstring above, residual
+    # is meant to be genuinely-added quiet/high-frequency detail that
+    # should survive untouched). Measured directly on input_test.mp3's own
+    # true digital-silence opening (source samples there are ~1e-13, i.e.
+    # exact silence, not just quiet): even though the existing gate
+    # correctly picks the locally-quieter of its two options there (gate
+    # lands near 0, preserving a near-cancellation between dominant and
+    # residual rather than breaking it), BOTH options still carry non-zero
+    # low-level content from perform_ist_iteration's own hard-threshold
+    # FFT ringing on a block whose real content is at/below the numerical
+    # noise floor - there is no genuine signal there for either dominant
+    # or residual to represent, so neither of the gate's two choices is
+    # actually correct; the third, correct option (suppress ist_changes
+    # entirely) is not one this gate can reach. Measured effect before this
+    # fix: a real ~1s slice of input_test.mp3 starting at its own true
+    # silence (upscale_factor=7, max_iterations=300, threshold_value=0.6 -
+    # the pinned baseline config) showed ~+3.7dB broadband RMS elevation in
+    # its first 0.02s (the exact-silence portion) relative to a no-IST
+    # interpolation-only control.
+    #
+    # The fix: a third, independent gate - silence_gate - scoped to
+    # whether there is any genuine signal here at all, measured from
+    # expanded_channel (the pre-IST interpolated baseline) itself rather
+    # than from the corrected/uncorrected candidates the gate above
+    # compares. Reuses the same _local_rms_envelope WOLA machinery
+    # (gate_block_size) to estimate expanded_channel's own local RMS
+    # relative to this channel's overall peak; silence_gate = clip(ratio /
+    # silence_floor_ratio, 0, 1) ** silence_gate_power multiplies the
+    # WHOLE candidate_result (both the dominant-band component the gate
+    # above already scoped, and residual_component, which nothing else
+    # ever touches) - suppressing ist_changes altogether specifically
+    # where the pre-IST signal itself is at/below the noise floor, leaving
+    # every other region (where there is real signal, however quiet)
+    # completely unaffected once the ratio clears the floor.
+    #
+    # silence_floor_ratio=0.005 was chosen to sit strictly below the
+    # smallest ratio the existing fade-in-onset regression fixture ever
+    # reaches (measured directly: 0.005685, constant across that fixture's
+    # entire tested onset window) - this gate saturates to 1 (no
+    # suppression at all) at or before that fixture's own quietest point,
+    # so it cannot interfere with the onset-cancellation protection the
+    # gate above exists for; it only engages measurably below that floor,
+    # a region genuine near-cancelling fade-ins in this fixture and in the
+    # "does not elevate quiet real material" regression's own 0.5-1.0s
+    # slice (measured ratio ~0.24) never reach. silence_gate_power=6
+    # (rather than a plain linear ramp) was chosen because a linear ramp
+    # at this same floor only reduced the measured lead-in elevation from
+    # +3.7dB to +2.3dB - still a real residual; a steeper power-law ramp
+    # pushes the deeply-silent samples (ratio orders of magnitude below
+    # the floor) much closer to fully suppressed while still reaching
+    # exactly 1 at the same floor value, regardless of exponent - measured
+    # directly, power=6 reduces the same lead-in window to ~+0.17dB
+    # (a >20x reduction in linear terms) with the 0.02-0.25s natural onset
+    # ramp and every other previously-measured window (0.5-1.0s quiet
+    # passage, the fade-in fixture, net-attenuation/no-elevation
+    # material) unchanged to the numerical noise floor, since none of them
+    # ever sit below the floor in the first place.
+    baseline_env = _local_rms_envelope(expanded_f32,
+                                       block_size=gate_block_size)
+    baseline_ratio = baseline_env / baseline_peak
+    silence_gate = np.clip(
+        baseline_ratio / silence_floor_ratio, 0.0, 1.0
+    ).astype(np.float32) ** silence_gate_power
+    candidate_result = candidate_result * silence_gate
+
+    candidate_combined_peak = np.max(np.abs(expanded_f32 + candidate_result))
+    if candidate_combined_peak <= baseline_peak * safety_margin:
+        return candidate_result
+
+    # Safety net: the frequency-selective split alone did not bound the
+    # peak closely enough (e.g. a pathological dominant_band_ratio that
+    # classifies nothing/too little as dominant) - fall back to one
+    # additional whole-signal uniform-shrink pass on top of the
+    # frequency-selective candidate, using the exact pre-existing method
+    # above (unchanged), still with the same envelope gating applied to
+    # its own correction for consistency.
+    current = candidate_result
+    fallback_scale = 1.0
+    for _ in range(max_rounds):
+        combined = expanded_f32 + current
         combined_peak = np.max(np.abs(combined))
         if combined_peak <= baseline_peak or combined_peak == 0:
             break
-        current = current * (baseline_peak / combined_peak)
-    return current
+        fallback_scale *= baseline_peak / combined_peak
+        current = candidate_result * fallback_scale
+
+    fallback_correction = (1 - fallback_scale) * candidate_result
+    return candidate_result - gate * fallback_correction
+
+
+def _limit_combined_peak_to_baseline(combined, baseline_peak,
+                                     block_size=2048):
+    """Locally trim the rare residual peak overshoot _cap_ist_changes_to_
+    baseline_peak's bounded shrink loop deliberately leaves behind.
+
+    audio-quality-checker's test_no_net_band_attenuation_vs_resample_
+    control (iterate-fat-llama v-2.0.1 cycle) found a small but systematic
+    400-4000Hz deficit (-0.146 to -0.201dB) vs. a plain bandlimited resample
+    control, with 0-400Hz essentially unaffected (+0.007/+0.012dB) - "the
+    residual IST peak-inflation tax" from _cap_ist_changes_to_baseline_
+    peak's own cap. Root-caused directly against real input_test.mp3 at the
+    pinned baseline config (upscale_factor=7, max_iterations=300,
+    threshold_value=0.6): that function's bounded (max_rounds=20, not fully
+    converged - see its own docstring for why full convergence is itself
+    undesirable, it squeezes genuinely-added detail toward zero) shrink
+    loop leaves each channel's combined (interpolation + IST) peak ~4.2-
+    4.6% above expanded_channel's own pre-IST peak. upscale()'s mandatory
+    final per-channel normalize_signal divides the ENTIRE channel by
+    whatever its own actual peak is - so that ~4.2-4.6% excess becomes a
+    ~0.36-0.39dB attenuation tax applied to every sample in the file,
+    including untouched mid/high bands that IST never boosted (bands IST
+    does boost, mostly low-frequency - see _cap_ist_changes_to_baseline_
+    peak's own docstring on natural spectra concentrating energy there -
+    partly or fully offset the tax with their own direct gain, which is
+    exactly the +0.007/+0.012dB at 0-400Hz vs. the -0.146 to -0.201dB
+    documented above at 400-4000Hz).
+
+    The key measurement that makes a LOCAL fix viable rather than a global
+    one: on the same real file, only ~0.003-0.01% of samples per channel
+    (145-512 of 4,672,878) actually exceed baseline_peak after the existing
+    cap, by up to ~4.5-4.6% each - a sparse handful of brief outliers, not
+    a broad frequency-domain problem. _cap_ist_changes_to_baseline_peak's
+    own dominant_scale is a single GLOBAL scalar applied via its gates
+    across the whole channel wherever gate==1 (most of a loud passage, per
+    its own docstring) - tightening that loop's convergence to fully
+    eliminate the excess (verified separately, via a bisection search) does
+    not just trim these rare outliers, it drives dominant_scale toward 0
+    globally, since these outlier samples' own overshoot is so slight
+    (~4.5% relative to that ONE sample's own magnitude, not to the whole
+    signal) that dominant_scale must collapse to near-zero everywhere
+    gate==1 to satisfy them exactly - reopening the "no measurable added
+    detail" regression this whole mechanism exists to avoid, for the LF
+    content it does successfully add. A genuinely local fix is needed
+    instead.
+
+    This function is that local fix: it estimates combined's own local
+    peak envelope (via _local_peak_envelope's existing WOLA machinery - no
+    new mechanism) and applies gain = min(1, baseline_peak / envelope), so
+    only the handful of blocks whose own local peak actually exceeds
+    baseline_peak get any gain reduction at all - everywhere else, gain is
+    exactly 1.0 (bit-identical passthrough). Because the overshoot is so
+    sparse, this measurably touches only ~0.04-0.12% of samples per channel
+    (1764-5728 of 4,672,878 at block_size=2048) and reduces each channel's
+    overall ist_changes RMS by under 2% (measured ratio 0.980-0.995) - a
+    small fraction of what full convergence would cost - while driving the
+    post-cap combined peak to exactly baseline_peak (0.0% measured excess),
+    eliminating the normalize-driven tax for the other ~99.9%+ of the file.
+    Applied to `combined` (expanded_channel + capped ist_changes), not
+    inside _cap_ist_changes_to_baseline_peak itself, so that function's own
+    frequency-selective split/gates and their existing regression coverage
+    are entirely unchanged - this is a strictly additive final safety trim.
+    """
+    if baseline_peak <= 0:
+        return combined
+    envelope = _local_peak_envelope(combined, block_size=block_size)
+    gain = np.minimum(
+        1.0, baseline_peak / np.maximum(envelope, 1e-12)
+    ).astype(np.float32)
+    return (combined * gain).astype(np.float32)
 
 
 def _process_channel(channel, upscale_factor, max_iter, threshold):
-    # The full per-channel pipeline (interpolate -> IST -> peak-cap),
-    # factored out so it can be dispatched either sequentially or on a
-    # worker thread by upscale_channels below - it only ever reads/writes
-    # its own `channel` argument, so it carries no shared state.
+    # The full per-channel pipeline (interpolate -> IST -> peak-cap ->
+    # local peak trim), factored out so it can be dispatched either
+    # sequentially or on a worker thread by upscale_channels below - it
+    # only ever reads/writes its own `channel` argument, so it carries no
+    # shared state.
     logger.info("Interpolating data...")
     expanded_channel = new_interpolation_algorithm(channel, upscale_factor)
 
@@ -506,7 +1168,9 @@ def _process_channel(channel, upscale_factor, max_iter, threshold):
                                               threshold)
     ist_changes = _cap_ist_changes_to_baseline_peak(expanded_channel,
                                                     ist_changes)
-    return expanded_channel.astype(np.float32) + ist_changes
+    combined = expanded_channel.astype(np.float32) + ist_changes
+    baseline_peak = float(np.max(np.abs(expanded_channel)))
+    return _limit_combined_peak_to_baseline(combined, baseline_peak)
 
 
 def upscale_channels(channels, upscale_factor, max_iter, threshold):
@@ -722,6 +1386,6 @@ def upscale(
     final_channels = np.column_stack(final_channels)
 
     write_audio(output_file_path, new_sample_rate, final_channels,
-               target_format)
+                target_format)
     logger.info(f"Saved processed {target_format.upper()} file at "
-               f"{output_file_path}")
+                f"{output_file_path}")
