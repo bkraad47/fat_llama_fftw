@@ -1562,6 +1562,239 @@ class TestFeed(unittest.TestCase):
             "detail gap may no longer be structural and this "
             "investigation's conclusion needs revisiting")
 
+    def test_iterative_soft_thresholding_block_size_does_not_change_hf_correlation_with_reference(
+            self):
+        # Cycle-2 (iterate-fat-llama) investigation of the still-open
+        # DIRECTIVES finding ("no IST-attributable added detail above
+        # 4kHz vs. a no-IST control"), testing the one suggested angle none
+        # of the four prior investigations covered: whether block_size (the
+        # WOLA analysis/synthesis window length) - not the threshold rule
+        # itself - was limiting genuine HF detail recovery. See
+        # iterative_soft_thresholding's own docstring comment for the full
+        # writeup; this is that investigation's regression coverage.
+        #
+        # Runs the FULL real pipeline tail (iterative_soft_thresholding ->
+        # _cap_ist_changes_to_baseline_peak -> _limit_combined_peak_to_
+        # baseline -> normalize_signal) at several block_size values, since
+        # measuring iterative_soft_thresholding's raw, uncapped output alone
+        # does not reflect what audio-quality-checker actually scores (the
+        # cap/gate/normalize stages materially change the final per-band
+        # gain). Confirms block_size measurably changes how much gets added
+        # (proving this is not a vacuous "nothing ever changes" check) while
+        # the added content's correlation with the lossless reference stays
+        # low regardless - i.e. block_size changes volume, not authenticity.
+        if not os.path.exists(_INPUT_TEST_MP3):
+            self.skipTest("input_test.mp3 reference asset not present")
+        if not os.path.exists(_INPUT_TEST_FLAC):
+            self.skipTest("input_test.flac reference asset not present")
+
+        sample_rate, mp3_samples, _ = read_audio(_INPUT_TEST_MP3,
+                                                          format='mp3')
+        _, flac_samples, _ = read_audio(_INPUT_TEST_FLAC, format='flac')
+        mp3_channel = mp3_samples[:, 0].astype(np.float32)
+        flac_channel = flac_samples[:, 0].astype(np.float32)
+        upscale_factor = 7
+        max_iter = 300
+        threshold = 0.6
+        start = 7 * sample_rate
+        n = 3 * sample_rate
+        self.assertLessEqual(start + n, len(mp3_channel),
+                             "input_test.mp3 shorter than expected - "
+                             "re-pick the slice window")
+        self.assertLessEqual(start + n, len(flac_channel),
+                             "input_test.flac shorter than expected - "
+                             "re-pick the slice window")
+
+        mp3_sig = mp3_channel[start:start + n]
+        flac_sig = flac_channel[start:start + n]
+
+        expanded = new_interpolation_algorithm(mp3_sig, upscale_factor)
+        ref_expanded = new_interpolation_algorithm(flac_sig, upscale_factor)
+        out_sr = sample_rate * upscale_factor
+
+        def band_filtered(signal, lo, hi):
+            spec = np.fft.rfft(signal.astype(np.float64))
+            f = np.fft.rfftfreq(len(signal), d=1.0 / out_sr)
+            spec_band = np.where((f >= lo) & (f < hi), spec, 0)
+            return np.fft.irfft(spec_band, n=len(signal))
+
+        def envelope(x, block=500):
+            kernel = np.ones(block) / block
+            return np.convolve(np.abs(x), kernel, mode='same')
+
+        def corr(a, b):
+            a = a - a.mean()
+            b = b - b.mean()
+            denom = np.linalg.norm(a) * np.linalg.norm(b)
+            return float(np.dot(a, b) / denom) if denom > 0 else 0.0
+
+        gains_16_20k = {}
+        correlations = {}
+        for block_size in (2048, 8192, 32768):
+            ist_changes = iterative_soft_thresholding(
+                expanded, max_iter, threshold, block_size=block_size)
+            capped = _cap_ist_changes_to_baseline_peak(expanded, ist_changes)
+            combined = expanded.astype(np.float32) + capped
+            baseline_peak = float(np.max(np.abs(expanded)))
+            trimmed = _limit_combined_peak_to_baseline(combined,
+                                                        baseline_peak)
+            final_norm = normalize_signal(trimmed.astype(np.float64))
+            control_norm = normalize_signal(expanded.astype(np.float64))
+
+            band = band_filtered(final_norm, 16000, 20000)
+            control_band = band_filtered(control_norm, 16000, 20000)
+            rms_band = np.sqrt(np.mean(band ** 2))
+            rms_control = np.sqrt(np.mean(control_band ** 2)) + 1e-15
+            gains_16_20k[block_size] = 20 * np.log10(
+                (rms_band + 1e-15) / rms_control)
+
+            diff_hf = band_filtered(final_norm - control_norm, 8000, 19000)
+            ref_hf = band_filtered(ref_expanded, 8000, 19000)
+            correlations[block_size] = corr(envelope(diff_hf),
+                                            envelope(ref_hf))
+
+        gain_spread = max(gains_16_20k.values()) - min(gains_16_20k.values())
+        self.assertGreater(
+            gain_spread, 0.1,
+            "block_size should measurably change the 16-20kHz gain "
+            f"(measured spread {gain_spread:.4f}dB across "
+            f"{gains_16_20k}) - if it never does, this test isn't "
+            "actually exercising the block_size lever")
+
+        for block_size, correlation in correlations.items():
+            self.assertLess(
+                abs(correlation), 0.2,
+                f"block_size={block_size}: HF content added vs. a no-IST "
+                f"control should not be meaningfully correlated with the "
+                f"lossless reference (measured {correlation:.4f}) - if a "
+                "particular block_size starts producing reference-"
+                "correlated HF gain, this investigation's conclusion "
+                "(block_size is not a lever for genuine detail recovery) "
+                "needs revisiting")
+
+    def test_iterative_soft_thresholding_noise_floor_relative_threshold_adds_noise_not_detail(
+            self):
+        # Cycle-2 (iterate-fat-llama) investigation of the same still-open
+        # DIRECTIVES finding, testing the second suggested-but-untried
+        # angle: a two-pass, per-bin noise-floor-relative threshold (first
+        # pass estimates each frequency bin's own noise floor across every
+        # WOLA block of the file; second pass keeps bins above a multiplier
+        # of that floor, instead of perform_ist_iteration's single
+        # block-global-peak-relative threshold). This mechanism was never
+        # wired into perform_ist_iteration/production code - it is
+        # reimplemented self-contained here, purely to measure whether the
+        # mechanism CLASS has any merit before considering shipping it. See
+        # perform_ist_iteration's own docstring comment for the full
+        # writeup; this is that investigation's regression coverage,
+        # documenting why it was rejected so a future cycle does not have
+        # to re-run this experiment from scratch.
+        if not os.path.exists(_INPUT_TEST_MP3):
+            self.skipTest("input_test.mp3 reference asset not present")
+        if not os.path.exists(_INPUT_TEST_FLAC):
+            self.skipTest("input_test.flac reference asset not present")
+
+        sample_rate, mp3_samples, _ = read_audio(_INPUT_TEST_MP3,
+                                                          format='mp3')
+        _, flac_samples, _ = read_audio(_INPUT_TEST_FLAC, format='flac')
+        mp3_channel = mp3_samples[:, 0].astype(np.float32)
+        flac_channel = flac_samples[:, 0].astype(np.float32)
+        upscale_factor = 7
+        start = 7 * sample_rate
+        n = 3 * sample_rate
+        mp3_sig = mp3_channel[start:start + n]
+        flac_sig = flac_channel[start:start + n]
+
+        expanded = new_interpolation_algorithm(mp3_sig, upscale_factor)
+        ref_expanded = new_interpolation_algorithm(flac_sig, upscale_factor)
+        out_sr = sample_rate * upscale_factor
+
+        block_size = 8192
+        hop = block_size // 2
+        window = np.sqrt(0.5 - 0.5 * np.cos(
+            2 * np.pi * np.arange(block_size) / block_size))
+        pad = hop
+        padded = np.concatenate([
+            np.zeros(pad), expanded.astype(np.float64),
+            np.zeros(block_size)])
+        padded_len = len(padded)
+        starts = list(range(0, padded_len - block_size + 1, hop))
+
+        mags = np.array([
+            np.abs(np.fft.fft(padded[s:s + block_size] * window))
+            for s in starts
+        ])
+        # Per-bin noise floor: 20th percentile magnitude across every
+        # block of the whole slice - a robust "typical quiet level" for
+        # that specific frequency bin, distinct from any single block's
+        # own peak (what perform_ist_iteration actually uses).
+        floor = np.percentile(mags, 20, axis=0)
+
+        multiplier = 2.0
+        output = np.zeros(padded_len)
+        weight = np.zeros(padded_len)
+        for s in starts:
+            frame = padded[s:s + block_size] * window
+            spec = np.fft.fft(frame)
+            mask = np.abs(spec) > multiplier * floor
+            mask[0] = False
+            spec_thres = np.where(mask, spec, 0)
+            result = np.fft.ifft(spec_thres).real
+            windowed = result * window
+            windowed = windowed - window * (
+                np.sum(windowed) / np.sum(window))
+            output[s:s + block_size] += windowed
+            weight[s:s + block_size] += window * window
+        safe_w = np.where(weight > 1e-8, weight, 1.0)
+        ist_changes = (output / safe_w)[pad:pad + len(expanded)]
+
+        def band_filtered(signal, lo, hi):
+            spec = np.fft.rfft(signal.astype(np.float64))
+            f = np.fft.rfftfreq(len(signal), d=1.0 / out_sr)
+            spec_band = np.where((f >= lo) & (f < hi), spec, 0)
+            return np.fft.irfft(spec_band, n=len(signal))
+
+        def envelope(x, block=500):
+            kernel = np.ones(block) / block
+            return np.convolve(np.abs(x), kernel, mode='same')
+
+        def corr(a, b):
+            a = a - a.mean()
+            b = b - b.mean()
+            denom = np.linalg.norm(a) * np.linalg.norm(b)
+            return float(np.dot(a, b) / denom) if denom > 0 else 0.0
+
+        combined = expanded.astype(np.float64) + ist_changes
+        control_band = band_filtered(expanded, 16000, 20000)
+        combined_band = band_filtered(combined, 16000, 20000)
+        rms_control = np.sqrt(np.mean(control_band ** 2)) + 1e-15
+        rms_combined = np.sqrt(np.mean(combined_band ** 2))
+        gain_db = 20 * np.log10((rms_combined + 1e-15) / rms_control)
+
+        # This mechanism DOES add a large amount of HF-band level (proving
+        # this test exercises a real effect, not a no-op) ...
+        self.assertGreater(
+            gain_db, 3.0,
+            "the noise-floor-relative threshold should measurably raise "
+            f"the 16-20kHz band vs. a no-IST control (measured "
+            f"{gain_db:.4f}dB) - if it stops doing so, this test isn't "
+            "actually exercising the mechanism under investigation")
+
+        res_hf = band_filtered(ist_changes, 8000, 19000)
+        ref_hf = band_filtered(ref_expanded, 8000, 19000)
+        hf_correlation = corr(envelope(res_hf), envelope(ref_hf))
+
+        # ... but that added content is not reference-correlated: it is the
+        # decoder's own dequantization noise floor, amplified uniformly
+        # across nearly the entire HF range (not selectively recovered
+        # programme detail). If a future cycle's tuning of this mechanism
+        # starts producing meaningfully correlated content, this
+        # investigation's rejection needs revisiting.
+        self.assertLess(
+            abs(hf_correlation), 0.2,
+            "the noise-floor-relative threshold's own HF content should "
+            f"not be meaningfully correlated with the lossless reference "
+            f"(measured {hf_correlation:.4f})")
+
     def test_iterative_soft_thresholding_chains_across_iterations(self):
         data = np.array([0.9, 0.1, -0.8, 0.05, 0.7, -0.2, 0.3, -0.6],
                         dtype=np.float32)

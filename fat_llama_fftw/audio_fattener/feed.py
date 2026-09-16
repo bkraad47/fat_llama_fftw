@@ -301,6 +301,43 @@ def perform_ist_iteration(data_thres, threshold):
     # the gap sits entirely in this function's single hard peak-relative
     # threshold decision on each block's first pass, not in anything
     # iteration-count-related or downstream of it.
+    #
+    # Investigated a later cycle (again NOT adopted): a two-pass, per-bin
+    # noise-floor-relative threshold - replace "keep bins above
+    # threshold * this block's own global peak" with "keep bins above
+    # multiplier * this bin's own noise floor", where the floor is
+    # estimated per-frequency-bin (a first pass, 20th-percentile magnitude
+    # across every WOLA block of the whole signal) rather than derived from
+    # any single block's own dynamics. This is a genuinely different
+    # mechanism class from both the per-band-peak variant above (which
+    # compares a bin to its OWN block's local peak) and the dominant/
+    # residual split in _cap_ist_changes_to_baseline_peak (which operates
+    # on ist_changes after the fact, not on the threshold decision itself).
+    # Measured directly on real input_test.mp3 (seconds 7-10, pinned
+    # baseline upscale_factor=7): the per-bin floor is ~5.6e5x smaller for
+    # HF bins (>=2kHz) than LF bins on this material (median ~2.2e-5 vs.
+    # ~12.4) - i.e. the decoded MP3's HF content isn't "quiet signal
+    # hiding near a noise floor" that a floor-relative threshold could
+    # selectively recover, it is uniformly near-zero across virtually the
+    # entire HF range (8085 of 8192 bins in one representative block
+    # already qualify as ">=2kHz"), so ANY floor-relative multiplier
+    # (tried: 1.5, 2.0, 3.0, 5.0) keeps the large majority of them
+    # indiscriminately. Effect: a large, uniform +4.8 to +6.0dB gain
+    # across every band from 2kHz to 20kHz alike (not concentrated where
+    # real programme content would be), while envelope correlation against
+    # the lossless input_test.flac reference measured essentially zero
+    # (-0.0045 to -0.0055, i.e. no correlation at all - worse than the
+    # per-band variant's already-low ~0.02-0.08). This is not masked
+    # signal a smarter threshold can uncover; it is the decoder's own
+    # dequantization noise floor, amplified uniformly. See
+    # test_iterative_soft_thresholding_noise_floor_relative_threshold_
+    # adds_noise_not_detail in test_feed.py for the regression coverage.
+    # Left as fft/ifft (unchanged) for the same reason the per-band
+    # variant above was rejected: the source MP3 has already destroyed
+    # this content before this pipeline ever sees it, and no post-hoc
+    # relative-threshold variant operating on what survives - global peak,
+    # per-band peak, or per-bin noise floor - can distinguish "real but
+    # quiet" from "gone" here.
     data_fft = pyfftw.interfaces.numpy_fft.fft(data_thres)
     fft_peak = np.max(np.abs(data_fft))
     if fft_peak == 0:
@@ -377,6 +414,33 @@ def iterative_soft_thresholding(data, max_iter, threshold,
     # window boundary sits) and each block's own hard-threshold fixed
     # point is found independently, so this does not reintroduce the
     # cycle-1 non-chaining bug or lose its convergence early-exit.
+    #
+    # Investigated a later cycle (NOT adopted, block_size default
+    # unchanged): whether block_size itself - not the threshold rule - was
+    # limiting genuine high-frequency detail recovery, a mechanism
+    # genuinely distinct from the four prior investigations into
+    # threshold_value, per-band thresholding, the peak-cap's dominant/
+    # residual split, and iteration count (see perform_ist_iteration's and
+    # _cap_ist_changes_to_baseline_peak's own docstring comments). Measured
+    # directly on real input_test.mp3/.flac (seconds 7-10, pinned baseline
+    # upscale_factor=7, threshold=0.6) across block_size in {2048, 4096,
+    # 8192 (default), 16384, 32768} through the FULL real pipeline tail
+    # (this function -> _cap_ist_changes_to_baseline_peak ->
+    # _limit_combined_peak_to_baseline -> normalize, matching what
+    # audio-quality-checker actually scores): the measured per-band gain
+    # vs. a no-IST control DOES shift with block_size (e.g. the 16-20kHz
+    # band ranged from +0.35dB at 8192 up to +1.00dB at 2048), so
+    # block_size is not inert - but the envelope correlation of that
+    # gained content against the lossless reference stayed essentially
+    # flat (~0.037-0.044) across every block_size tried, both larger and
+    # smaller than the current default. A lever that changes how MUCH gets
+    # added without changing whether it is genuine, reference-correlated
+    # detail confirms the same root cause the other four investigations
+    # already converged on (the content is not there to recover, at any
+    # window length), rather than opening a new one. See
+    # test_iterative_soft_thresholding_block_size_does_not_change_hf_
+    # correlation_with_reference in test_feed.py for the regression
+    # coverage.
     n = len(data)
     if n <= block_size:
         return _ist_chain(data, max_iter, threshold, convergence_tol)
