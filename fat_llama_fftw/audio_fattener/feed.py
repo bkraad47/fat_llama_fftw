@@ -986,7 +986,8 @@ def _cap_ist_changes_to_baseline_peak(expanded_channel, ist_changes,
     # passage, the fade-in fixture, net-attenuation/no-elevation
     # material) unchanged to the numerical noise floor, since none of them
     # ever sit below the floor in the first place.
-    baseline_env = _local_rms_envelope(expanded_f32, block_size=gate_block_size)
+    baseline_env = _local_rms_envelope(expanded_f32,
+                                       block_size=gate_block_size)
     baseline_ratio = baseline_env / baseline_peak
     silence_gate = np.clip(
         baseline_ratio / silence_floor_ratio, 0.0, 1.0
@@ -1018,11 +1019,83 @@ def _cap_ist_changes_to_baseline_peak(expanded_channel, ist_changes,
     return candidate_result - gate * fallback_correction
 
 
+def _limit_combined_peak_to_baseline(combined, baseline_peak,
+                                     block_size=2048):
+    """Locally trim the rare residual peak overshoot _cap_ist_changes_to_
+    baseline_peak's bounded shrink loop deliberately leaves behind.
+
+    audio-quality-checker's test_no_net_band_attenuation_vs_resample_
+    control (iterate-fat-llama v-2.0.1 cycle) found a small but systematic
+    400-4000Hz deficit (-0.146 to -0.201dB) vs. a plain bandlimited resample
+    control, with 0-400Hz essentially unaffected (+0.007/+0.012dB) - "the
+    residual IST peak-inflation tax" from _cap_ist_changes_to_baseline_
+    peak's own cap. Root-caused directly against real input_test.mp3 at the
+    pinned baseline config (upscale_factor=7, max_iterations=300,
+    threshold_value=0.6): that function's bounded (max_rounds=20, not fully
+    converged - see its own docstring for why full convergence is itself
+    undesirable, it squeezes genuinely-added detail toward zero) shrink
+    loop leaves each channel's combined (interpolation + IST) peak ~4.2-
+    4.6% above expanded_channel's own pre-IST peak. upscale()'s mandatory
+    final per-channel normalize_signal divides the ENTIRE channel by
+    whatever its own actual peak is - so that ~4.2-4.6% excess becomes a
+    ~0.36-0.39dB attenuation tax applied to every sample in the file,
+    including untouched mid/high bands that IST never boosted (bands IST
+    does boost, mostly low-frequency - see _cap_ist_changes_to_baseline_
+    peak's own docstring on natural spectra concentrating energy there -
+    partly or fully offset the tax with their own direct gain, which is
+    exactly the +0.007/+0.012dB at 0-400Hz vs. the -0.146 to -0.201dB
+    documented above at 400-4000Hz).
+
+    The key measurement that makes a LOCAL fix viable rather than a global
+    one: on the same real file, only ~0.003-0.01% of samples per channel
+    (145-512 of 4,672,878) actually exceed baseline_peak after the existing
+    cap, by up to ~4.5-4.6% each - a sparse handful of brief outliers, not
+    a broad frequency-domain problem. _cap_ist_changes_to_baseline_peak's
+    own dominant_scale is a single GLOBAL scalar applied via its gates
+    across the whole channel wherever gate==1 (most of a loud passage, per
+    its own docstring) - tightening that loop's convergence to fully
+    eliminate the excess (verified separately, via a bisection search) does
+    not just trim these rare outliers, it drives dominant_scale toward 0
+    globally, since these outlier samples' own overshoot is so slight
+    (~4.5% relative to that ONE sample's own magnitude, not to the whole
+    signal) that dominant_scale must collapse to near-zero everywhere
+    gate==1 to satisfy them exactly - reopening the "no measurable added
+    detail" regression this whole mechanism exists to avoid, for the LF
+    content it does successfully add. A genuinely local fix is needed
+    instead.
+
+    This function is that local fix: it estimates combined's own local
+    peak envelope (via _local_peak_envelope's existing WOLA machinery - no
+    new mechanism) and applies gain = min(1, baseline_peak / envelope), so
+    only the handful of blocks whose own local peak actually exceeds
+    baseline_peak get any gain reduction at all - everywhere else, gain is
+    exactly 1.0 (bit-identical passthrough). Because the overshoot is so
+    sparse, this measurably touches only ~0.04-0.12% of samples per channel
+    (1764-5728 of 4,672,878 at block_size=2048) and reduces each channel's
+    overall ist_changes RMS by under 2% (measured ratio 0.980-0.995) - a
+    small fraction of what full convergence would cost - while driving the
+    post-cap combined peak to exactly baseline_peak (0.0% measured excess),
+    eliminating the normalize-driven tax for the other ~99.9%+ of the file.
+    Applied to `combined` (expanded_channel + capped ist_changes), not
+    inside _cap_ist_changes_to_baseline_peak itself, so that function's own
+    frequency-selective split/gates and their existing regression coverage
+    are entirely unchanged - this is a strictly additive final safety trim.
+    """
+    if baseline_peak <= 0:
+        return combined
+    envelope = _local_peak_envelope(combined, block_size=block_size)
+    gain = np.minimum(
+        1.0, baseline_peak / np.maximum(envelope, 1e-12)
+    ).astype(np.float32)
+    return (combined * gain).astype(np.float32)
+
+
 def _process_channel(channel, upscale_factor, max_iter, threshold):
-    # The full per-channel pipeline (interpolate -> IST -> peak-cap),
-    # factored out so it can be dispatched either sequentially or on a
-    # worker thread by upscale_channels below - it only ever reads/writes
-    # its own `channel` argument, so it carries no shared state.
+    # The full per-channel pipeline (interpolate -> IST -> peak-cap ->
+    # local peak trim), factored out so it can be dispatched either
+    # sequentially or on a worker thread by upscale_channels below - it
+    # only ever reads/writes its own `channel` argument, so it carries no
+    # shared state.
     logger.info("Interpolating data...")
     expanded_channel = new_interpolation_algorithm(channel, upscale_factor)
 
@@ -1031,7 +1104,9 @@ def _process_channel(channel, upscale_factor, max_iter, threshold):
                                               threshold)
     ist_changes = _cap_ist_changes_to_baseline_peak(expanded_channel,
                                                     ist_changes)
-    return expanded_channel.astype(np.float32) + ist_changes
+    combined = expanded_channel.astype(np.float32) + ist_changes
+    baseline_peak = float(np.max(np.abs(expanded_channel)))
+    return _limit_combined_peak_to_baseline(combined, baseline_peak)
 
 
 def upscale_channels(channels, upscale_factor, max_iter, threshold):

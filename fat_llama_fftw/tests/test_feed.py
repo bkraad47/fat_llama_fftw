@@ -11,6 +11,7 @@ from fat_llama_fftw.audio_fattener.feed import (
     iterative_soft_thresholding,
     upscale_channels,
     _cap_ist_changes_to_baseline_peak,
+    _limit_combined_peak_to_baseline,
     _local_peak_envelope,
     _local_rms_envelope,
     _fft_thread_count,
@@ -1196,6 +1197,157 @@ class TestFeed(unittest.TestCase):
         self.assertGreater(lb_ctrl_mag, 0)
         lb_ratio_db = 20 * np.log10(low_band_mag(final_ist) / lb_ctrl_mag)
         self.assertLess(lb_ratio_db, 0.5)
+
+    def test_limit_combined_peak_to_baseline_passes_through_when_not_needed(
+            self):
+        # _limit_combined_peak_to_baseline's gain is exactly 1.0 (bit-
+        # identical passthrough) everywhere the local envelope does not
+        # exceed baseline_peak - it must not touch a signal that never
+        # overshoots at all.
+        combined = np.array([1.0, -1.0, 0.5, -0.5, 0.9, -0.9],
+                            dtype=np.float32)
+        baseline_peak = 1.0
+        result = _limit_combined_peak_to_baseline(combined, baseline_peak,
+                                                   block_size=4)
+        np.testing.assert_array_equal(result, combined)
+
+    def test_limit_combined_peak_to_baseline_zero_baseline_passthrough(self):
+        # Guards the baseline_peak <= 0 short-circuit, mirroring
+        # _cap_ist_changes_to_baseline_peak's own zero-baseline guard.
+        combined = np.array([1.0, -1.0, 2.0], dtype=np.float32)
+        result = _limit_combined_peak_to_baseline(combined, 0.0)
+        np.testing.assert_array_equal(result, combined)
+
+    def test_limit_combined_peak_to_baseline_bounds_a_brief_spike(self):
+        # Regression test for this cycle's fix: a signal that is otherwise
+        # exactly at baseline_peak, but has one brief localized spike well
+        # above it (mirroring the sparse, few-sample overshoot
+        # _cap_ist_changes_to_baseline_peak's bounded shrink loop measurably
+        # leaves behind on real material - see this function's own
+        # docstring), must have that spike's local region brought back down
+        # to baseline_peak, while samples far from the spike (outside the
+        # WOLA block's own influence) are left materially unchanged.
+        n = 4096
+        block_size = 256
+        rng = np.random.default_rng(0)
+        combined = (0.5 * np.sin(
+            2 * np.pi * 5 * np.arange(n) / n)).astype(np.float32)
+        baseline_peak = 0.5
+        spike_idx = n // 2
+        combined[spike_idx] = 0.5 * 1.5  # 50% above baseline_peak locally
+
+        result = _limit_combined_peak_to_baseline(combined, baseline_peak,
+                                                   block_size=block_size)
+        self.assertLessEqual(float(np.max(np.abs(result))),
+                             baseline_peak * 1.001)
+        # Far from the spike (several blocks away), the WOLA envelope's own
+        # influence has decayed and gain should be back to (near) 1.0 - the
+        # fix must not globally shrink the whole signal to bound one local
+        # spike.
+        far = spike_idx + 4 * block_size
+        if far < n:
+            np.testing.assert_allclose(result[far], combined[far],
+                                       atol=1e-4)
+
+    def test_process_channel_wires_peak_limit_after_cap(self):
+        # End-to-end wiring check that _process_channel's own combined
+        # (interpolation + capped IST) output never exceeds its pre-IST
+        # interpolation baseline peak by more than a tight numerical
+        # tolerance - closing the gap the pre-existing, looser
+        # (baseline_peak * 1.25) test_upscale_channels_caps_combined_peak_
+        # close_to_baseline_stereo bound above does not: that bound only
+        # confirms _cap_ist_changes_to_baseline_peak's own (deliberately
+        # not-fully-converged) shrink loop, whereas this one confirms the
+        # new local peak-limit stage this cycle added on top of it actually
+        # runs as part of the real _process_channel/upscale_channels call
+        # path, not just in isolation.
+        sample_rate = 44100
+        duration = 0.3
+        n = int(sample_rate * duration)
+        t = np.arange(n) / sample_rate
+        sig = (9000.0 * np.sin(2 * np.pi * 180.0 * t)
+              + 300.0 * np.sin(2 * np.pi * 6500.0 * t)).astype(np.float32)
+        channels = sig[:, np.newaxis]
+
+        result = upscale_channels(channels, upscale_factor=3, max_iter=200,
+                                  threshold=0.6)
+
+        baseline = new_interpolation_algorithm(sig, 3)
+        baseline_peak = float(np.max(np.abs(baseline)))
+        combined_peak = float(np.max(np.abs(result[:, 0])))
+        self.assertLessEqual(combined_peak, baseline_peak * 1.01)
+
+    def test_upscale_channels_does_not_net_attenuate_mid_band_real_material(
+            self):
+        # Direct regression test for this cycle's fix: audio-quality-
+        # checker's test_no_net_band_attenuation_vs_resample_control found
+        # a systematic 400-4000Hz deficit (-0.146 to -0.201dB) vs. a plain
+        # bandlimited-resample (no-IST) control, root-caused to
+        # _cap_ist_changes_to_baseline_peak's own bounded shrink loop
+        # leaving a small (~4.2-4.6%) residual peak excess that upscale()'s
+        # mandatory final per-channel normalize then "spends" uniformly
+        # across every band, including ones IST never boosted - see
+        # _limit_combined_peak_to_baseline's own docstring for the full
+        # measurement. Same real slice/pinned-config methodology as
+        # test_upscale_channels_ist_does_not_net_attenuate_real_material
+        # above (seconds 7-10 of input_test.mp3, upscale_factor=7,
+        # max_iterations=300, threshold_value=0.6), but scoped to the
+        # specific 400-4000Hz band the finding measured, not the broader
+        # 2kHz-Nyquist "high-shelf" aggregate the sibling test already
+        # covers. Measured directly with this cycle's fix in place: this
+        # band now lands at +0.01 to +0.07dB (net-positive, not attenuated)
+        # instead of the pre-fix deficit.
+        if not os.path.exists(_INPUT_TEST_MP3):
+            self.skipTest("input_test.mp3 reference asset not present")
+
+        sample_rate, samples, bitrate = read_audio(_INPUT_TEST_MP3,
+                                                           format='mp3')
+        channel = samples[:, 0].astype(np.float32)
+        start = 7 * sample_rate
+        n = 3 * sample_rate
+        self.assertLessEqual(start + n, len(channel),
+                             "input_test.mp3 shorter than expected - "
+                             "re-pick the slice window")
+        sig = channel[start:start + n]
+
+        channels = sig[:, np.newaxis]
+        upscale_factor = 7
+        max_iter = 300
+        threshold = 0.6
+
+        ist_out = upscale_channels(channels, upscale_factor, max_iter,
+                                   threshold)[:, 0]
+        interp_only = new_interpolation_algorithm(sig, upscale_factor)
+
+        new_sample_rate = sample_rate * upscale_factor
+        original_nyquist = sample_rate / 2.0
+        orig_peak = float(np.max(np.abs(sig)))
+
+        def tail(x):
+            scaled = normalize_signal(x) * orig_peak
+            filtered = apply_nyquist_cutoff(scaled, new_sample_rate,
+                                            original_nyquist)
+            return normalize_signal(filtered)
+
+        final_ist = tail(ist_out)
+        final_ctrl = tail(interp_only)
+
+        def mid_band_mag(x):
+            spec = np.abs(np.fft.rfft(x.astype(np.float64)))
+            freqs = np.fft.rfftfreq(len(x), d=1.0 / new_sample_rate)
+            mask = (freqs >= 400) & (freqs < 4000)
+            self.assertTrue(mask.any())
+            return float(np.sqrt(np.mean(spec[mask] ** 2)))
+
+        ctrl_mag = mid_band_mag(final_ctrl)
+        self.assertGreater(ctrl_mag, 0)
+        mid_ratio_db = 20 * np.log10(mid_band_mag(final_ist) / ctrl_mag)
+        # Pre-fix this measured a systematic -0.146 to -0.201dB deficit
+        # (audio-quality-checker) / -0.29dB (this slice, pre-fix
+        # measurement); -0.05dB sits with real margin above the fix's own
+        # measured +0.01 to +0.07dB while still catching a regression back
+        # toward that deficit.
+        self.assertGreater(mid_ratio_db, -0.05)
 
     def test_cap_ist_changes_dominant_split_does_not_bottleneck_hf_content(
             self):
